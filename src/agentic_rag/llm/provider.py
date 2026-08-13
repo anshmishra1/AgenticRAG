@@ -1,18 +1,4 @@
-"""Provider-agnostic LLM layer, split into two tiers with dynamic fallback ordering.
-
-'primary' - Larger, 70B-class models used for generate() where answer quality and reasoning matter.
-'fast'    - Smaller, high-throughput models (e.g., Llama-3.1-8B, Qwen-2.5) optimized for prompt-tuned 
-            classification, query rewriting, grading, and guardrail checks.
-
-Configured providers:
-    - Groq
-    - Cerebras
-    - NVIDIA NIM
-    - OpenRouter
-    - AWS Bedrock (optional)
-
-Fallback order within each tier is controlled via `settings.provider_order`.
-"""
+"""Provider-agnostic LLM layer with two configurable tiers and fallback."""
 
 from __future__ import annotations
 
@@ -30,36 +16,33 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-# Multi-tier model definitions with fallback options per provider
+
 _MODELS: dict[str, dict[str, str]] = {
     "primary": {
-        "groq": getattr(settings, "groq_primary_model", "llama-3.3-70b-versatile"),
-        "cerebras": getattr(settings, "cerebras_primary_model", "llama-3.3-70b"),
-        "nvidia": getattr(settings, "nvidia_primary_model", "meta/llama-3.3-70b-instruct"),
-        "openrouter": getattr(settings, "openrouter_primary_model", "meta-llama/llama-3.3-70b-instruct"),
-        "bedrock": getattr(settings, "bedrock_primary_model", "us.meta.llama3-3-70b-instruct-v1:0"),
+        "groq": settings.groq_model,
+        "cerebras": settings.cerebras_model,
+        "nvidia": settings.nvidia_model,
+        "openrouter": settings.openrouter_model,
+        "bedrock": settings.bedrock_model,
     },
     "fast": {
-        "groq": getattr(settings, "groq_fast_model", "llama-3.1-8b-instant"),
-        "cerebras": getattr(settings, "cerebras_fast_model", "llama3.1-8b"),
-        "nvidia": getattr(settings, "nvidia_fast_model", "meta/llama-3.1-8b-instruct"),
-        "openrouter": getattr(settings, "openrouter_fast_model", "qwen/qwen-2.5-7b-instruct"),
-        "bedrock": getattr(settings, "bedrock_fast_model", "us.meta.llama3-1-8b-instruct-v1:0"),
+        "groq": settings.groq_fast_model,
+        "cerebras": settings.cerebras_fast_model,
+        "nvidia": settings.nvidia_fast_model,
+        "openrouter": settings.openrouter_fast_model,
+        "bedrock": settings.bedrock_fast_model,
     },
 }
 
 
 class ProviderChain:
-    """Configurable LLM provider chain with automatic fallback.
-
-    `tier` dictates which model profile is initialized for the chain:
-      - 'primary': high-capability, 70B+ parameter models.
-      - 'fast': high-throughput, low-latency models for classification, grading, and routing.
-    """
+    """Configurable LLM provider chain with automatic fallback."""
 
     def __init__(self, tier: str = "primary") -> None:
         if tier not in _MODELS:
-            raise ValueError(f"Invalid tier '{tier}'. Expected one of {list(_MODELS.keys())}.")
+            raise ValueError(
+                f"Invalid tier '{tier}'. Expected one of {list(_MODELS.keys())}."
+            )
 
         self.tier = tier
         self._last_provider: str | None = None
@@ -68,7 +51,7 @@ class ProviderChain:
         if not self._providers:
             raise RuntimeError(
                 f"No LLM provider initialized for tier '{self.tier}'. "
-                "Check your .env settings for API keys and PROVIDER_ORDER."
+                "Check .env settings for API keys and PROVIDER_ORDER."
             )
 
         logger.info(
@@ -77,9 +60,13 @@ class ProviderChain:
             [name for name, _ in self._providers],
         )
 
-    # =========================================================
-    # Provider construction
-    # =========================================================
+    @property
+    def timeout(self) -> float:
+        return (
+            settings.fast_llm_timeout
+            if self.tier == "fast"
+            else settings.primary_llm_timeout
+        )
 
     def _build_providers(self) -> list[tuple[str, BaseChatModel]]:
         available = {
@@ -90,10 +77,10 @@ class ProviderChain:
             "bedrock": self._build_bedrock,
         }
 
-        # Retrieve provider order from settings or default sequence
-        raw_order = getattr(settings, "provider_order", "groq,cerebras,nvidia,openrouter,bedrock")
         configured_order = [
-            p.strip().lower() for p in raw_order.split(",") if p.strip()
+            provider.strip().lower()
+            for provider in settings.provider_order.split(",")
+            if provider.strip()
         ]
 
         providers: list[tuple[str, BaseChatModel]] = []
@@ -121,86 +108,74 @@ class ProviderChain:
 
         return providers
 
-    # =========================================================
-    # Provider-specific builders
-    # =========================================================
-
     def _build_groq(self) -> BaseChatModel | None:
-        if not getattr(settings, "groq_api_key", None):
+        if not settings.groq_api_key:
             logger.info("Groq skipped: GROQ_API_KEY not configured.")
             return None
 
         from langchain_groq import ChatGroq
 
-        model_name = _MODELS[self.tier]["groq"]
         return ChatGroq(
             groq_api_key=settings.groq_api_key,
-            model_name=model_name,
+            model_name=_MODELS[self.tier]["groq"],
+            timeout=self.timeout,
         )
 
     def _build_cerebras(self) -> BaseChatModel | None:
-        if not getattr(settings, "cerebras_api_key", None):
+        if not settings.cerebras_api_key:
             logger.info("Cerebras skipped: CEREBRAS_API_KEY not configured.")
             return None
 
         from langchain_cerebras import ChatCerebras
 
-        model_name = _MODELS[self.tier]["cerebras"]
         return ChatCerebras(
             api_key=settings.cerebras_api_key,
-            model=model_name,
+            model=_MODELS[self.tier]["cerebras"],
+            timeout=self.timeout,
         )
 
     def _build_nvidia(self) -> BaseChatModel | None:
-        if not getattr(settings, "nvidia_api_key", None):
+        if not settings.nvidia_api_key:
             logger.info("NVIDIA skipped: NVIDIA_API_KEY not configured.")
             return None
 
         from langchain_openai import ChatOpenAI
 
-        model_name = _MODELS[self.tier]["nvidia"]
-        base_url = getattr(settings, "nvidia_base_url", "https://integrate.api.nvidia.com/v1")
         return ChatOpenAI(
             api_key=settings.nvidia_api_key,
-            base_url=base_url,
-            model=model_name,
+            base_url=settings.nvidia_base_url,
+            model=_MODELS[self.tier]["nvidia"],
+            timeout=self.timeout,
         )
 
     def _build_openrouter(self) -> BaseChatModel | None:
-        if not getattr(settings, "openrouter_api_key", None):
+        if not settings.openrouter_api_key:
             logger.info("OpenRouter skipped: OPENROUTER_API_KEY not configured.")
             return None
 
         from langchain_openai import ChatOpenAI
 
-        model_name = _MODELS[self.tier]["openrouter"]
-        base_url = getattr(settings, "openrouter_base_url", "https://openrouter.ai/api/v1")
         return ChatOpenAI(
             api_key=settings.openrouter_api_key,
-            base_url=base_url,
-            model=model_name,
+            base_url=settings.openrouter_base_url,
+            model=_MODELS[self.tier]["openrouter"],
+            timeout=self.timeout,
         )
 
     def _build_bedrock(self) -> BaseChatModel | None:
-        bedrock_enabled = getattr(settings, "bedrock_enabled", True)
-        if not bedrock_enabled or not getattr(settings, "aws_bedrock_region", None):
-            logger.info("Bedrock skipped: AWS region or BEDROCK_ENABLED not configured.")
+        if not settings.bedrock_enabled or not settings.aws_bedrock_region:
+            logger.info("Bedrock skipped: disabled or AWS region not configured.")
             return None
 
         from langchain_aws import ChatBedrockConverse
 
-        model_name = _MODELS[self.tier]["bedrock"]
         return ChatBedrockConverse(
             region_name=settings.aws_bedrock_region,
-            model=model_name,
+            model=_MODELS[self.tier]["bedrock"],
         )
 
-    # =========================================================
-    # Invocation & Fallback Execution
-    # =========================================================
-
     def invoke(self, prompt: Any):
-        """Invokes the LLM using configured providers in order until one succeeds."""
+        """Invoke providers in configured order until one succeeds."""
         last_error: Exception | None = None
 
         for index, (name, llm) in enumerate(self._providers, start=1):
@@ -230,38 +205,21 @@ class ProviderChain:
             f"Last error: {last_error}"
         )
 
-    # =========================================================
-    # Primary LangChain model
-    # =========================================================
-
     def as_langchain_llm(self) -> BaseChatModel:
-        """Return the primary provider for LangChain components requiring a BaseChatModel directly.
-
-        Note:
-            Automatic fallback only occurs when invoking via `ProviderChain.invoke()`.
-        """
         return self._providers[0][1]
-
-    # =========================================================
-    # Properties & Diagnostics
-    # =========================================================
 
     @property
     def primary_provider(self) -> str:
-        """Return the currently configured primary provider name for this tier."""
         return self._providers[0][0]
 
     @property
     def last_provider(self) -> str | None:
-        """Return the provider used by the most recent successful invocation."""
         return self._last_provider
 
     @property
     def provider_names(self) -> list[str]:
-        """Names of all successfully initialized providers for this tier."""
         return [name for name, _ in self._providers]
 
 
-# Singletons instantiated per tier
-provider_chain = ProviderChain(tier="primary")    # Answer generation
-fast_provider_chain = ProviderChain(tier="fast")  # Contextualization, grading, query rewrite, hallucination check
+provider_chain = ProviderChain(tier="primary")
+fast_provider_chain = ProviderChain(tier="fast")
