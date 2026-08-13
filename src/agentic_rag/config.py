@@ -14,22 +14,21 @@ class Settings(BaseSettings):
     pinecone_api_key: str = ""
     hf_token: str = ""
 
-    # Provider models
+    # Primary provider models
     groq_model: str = "llama-3.3-70b-versatile"
     cerebras_model: str = "gpt-oss-120b"
     nvidia_model: str = "meta/llama-3.1-70b-instruct"
     openrouter_model: str = "openai/gpt-4o-mini"
     bedrock_model: str = "meta.llama3-3-70b-instruct-v1:0"
 
-    # Fast-tier models. Defaults intentionally use the same configured
-    # provider model until a separate fast model is explicitly configured.
-    groq_fast_model: str = "llama-3.3-70b-versatile"
-    cerebras_fast_model: str = "gpt-oss-120b"
-    nvidia_fast_model: str = "meta/llama-3.1-70b-instruct"
-    openrouter_fast_model: str = "openai/gpt-4o-mini"
-    bedrock_fast_model: str = "meta.llama3-3-70b-instruct-v1:0"
+    # Fast-tier models
+    groq_fast_model: str = "llama-3.1-8b-instant"
+    cerebras_fast_model: str = "llama3.1-8b"
+    nvidia_fast_model: str = "meta/llama-3.1-8b-instruct"
+    openrouter_fast_model: str = "qwen/qwen-2.5-7b-instruct"
+    bedrock_fast_model: str = "us.meta.llama3-1-8b-instruct-v1:0"
 
-    # Provider endpoints
+    # Provider endpoints and fallback order
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     provider_order: str = "cerebras,groq,nvidia,openrouter"
