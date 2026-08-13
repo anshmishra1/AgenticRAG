@@ -21,14 +21,6 @@ def get_vectorstore() -> PineconeVectorStore:
     )
 
 
-def get_retriever(k: int = 5):
-    """Existing retriever kept for compatibility."""
-
-    return get_vectorstore().as_retriever(
-        search_kwargs={"k": k}
-    )
-
-
 def retrieve_with_scores(
     query: str,
     k: int = 5,
@@ -42,17 +34,4 @@ def retrieve_with_scores(
         query,
         k=k,
         filter=filter,
-    )
-
-
-def get_overview_retriever(k: int = 5):
-    """Retrieve only whole-document overview chunks."""
-
-    return get_vectorstore().as_retriever(
-        search_kwargs={
-            "k": k,
-            "filter": {
-                "type": {"$eq": "overview"}
-            },
-        }
     )
