@@ -5,6 +5,8 @@ The Postgres checkpointer connection opens once at app startup and closes once
 at shutdown, via FastAPI's lifespan - same context-manager pattern as
 PostgresSaver.from_conn_string(...), just held open for the app's lifetime
 instead of a single script block."""
+
+import logging
 import shutil
 import tempfile
 from contextlib import asynccontextmanager
@@ -16,19 +18,25 @@ from pydantic import BaseModel
 
 from agentic_rag.config import settings
 from agentic_rag.graph.builder import build_graph
-from agentic_rag.ingestion.pipeline import ingest_file
+from agentic_rag.ingestion.pipeline import _document_id, ingest_file
+from agentic_rag.ingestion.registry import list_documents
 from agentic_rag.observability.trace import configure_logging
 
+# Configure logging
 configure_logging(settings.debug)
+
+# Mute noisy HTTP and Hugging Face Hub logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     with PostgresSaver.from_conn_string(settings.postgres_url) as checkpointer:
-        checkpointer.setup()  # creates checkpoint tables if they don't exist yet; idempotent
+        checkpointer.setup()  # Creates checkpoint tables if they don't exist yet; idempotent
         app.state.rag_graph = build_graph(checkpointer)
         yield
-    # connection closes automatically here on shutdown
+    # Connection closes automatically here on shutdown
 
 
 app = FastAPI(title="Agentic RAG API", lifespan=lifespan)
@@ -90,10 +98,6 @@ async def ingest(files: list[UploadFile] = File(...)) -> list[IngestResult]:
             tmp_path = tmp.name
 
         try:
-            # Keep the API response aligned with the same content-based ID
-            # used by ingestion/pipeline.py.
-            from agentic_rag.ingestion.pipeline import _document_id
-
             document_id = _document_id(Path(tmp_path))
             chunk_count = ingest_file(
                 tmp_path,
@@ -118,8 +122,6 @@ async def ingest(files: list[UploadFile] = File(...)) -> list[IngestResult]:
 def documents() -> list[dict]:
     """Returns what's actually been ingested - a direct metadata answer, not a
     question routed through the RAG graph."""
-    from agentic_rag.ingestion.registry import list_documents
-
     return list_documents()
 
 

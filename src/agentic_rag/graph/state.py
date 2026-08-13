@@ -36,6 +36,17 @@ class RAGState(TypedDict, total=False):
     hallucination_retry_count: int
     generation: str
 
+    # Conversation / query routing
+    query_intent: str
+    query_is_control: bool
+    contextualization_used: bool
+
+    # Generation diagnostics
+    generation_context_chars: int
+    generation_history_chars: int
+    generation_prompt_chars: int
+    generation_output_chars: int
+
     # Conversation state
     messages: Annotated[list, add_messages]
     trace: list[dict]

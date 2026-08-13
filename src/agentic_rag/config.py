@@ -139,5 +139,20 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # =========================================================
+    # Conversation / Generation Optimization
+    # =========================================================
+
+    max_history_messages_for_generation: int = 2
+
+    max_generation_context_documents: int = 5
+
+    max_generation_context_chars: int = 12000
+
+    max_generation_output_chars: int = 12000
+
+    # Retrieval assessment
+    retrieval_min_top_score: float = 0.35
+    retrieval_strong_top_score: float = 0.55
 
 settings = Settings()

@@ -18,6 +18,7 @@ import logging
 
 from langchain_core.messages import AIMessage, HumanMessage
 
+from agentic_rag.config import settings
 from agentic_rag.graph.state import RAGState
 from agentic_rag.llm.provider import provider_chain, fast_provider_chain
 from agentic_rag.retrieval.vectorstore import retrieve_with_scores
@@ -54,23 +55,173 @@ def _preview(text: str, length: int = 500) -> str:
 
 
 # =============================================================
-# Contextualize Question
+# Query Intent
 # =============================================================
 
+CONTROL_QUERY_PATTERNS = (
+    "no more questions",
+    "no further questions",
+    "nothing else",
+    "that's all",
+    "that is all",
+    "thanks",
+    "thank you",
+    "stop",
+    "done",
+    "end this",
+)
+
+
+def classify_query_intent(
+    question: str,
+    history: list,
+) -> tuple[str, bool]:
+    """
+    Lightweight deterministic query-intent classification.
+
+    Returns:
+        (intent, is_control)
+
+    Intents:
+        - new_question
+        - follow_up
+        - control
+    """
+
+    normalized = " ".join(question.lower().split())
+
+    # ---------------------------------------------------------
+    # Control / conversation-ending input
+    # ---------------------------------------------------------
+
+    if any(pattern in normalized for pattern in CONTROL_QUERY_PATTERNS):
+        return "control", True
+
+    # ---------------------------------------------------------
+    # No history -> cannot be a follow-up
+    # ---------------------------------------------------------
+
+    if not history:
+        return "new_question", False
+
+    # ---------------------------------------------------------
+    # Strong follow-up indicators
+    # ---------------------------------------------------------
+
+    follow_up_indicators = (
+        "elaborate",
+        "elaborate further",
+        "explain further",
+        "explain more",
+        "tell me more",
+        "expand on",
+        "expand upon",
+        "go deeper",
+        "in more detail",
+        "more details",
+        "why is that",
+        "how so",
+        "what about that",
+        "can you clarify",
+        "clarify that",
+        "what do you mean",
+    )
+
+    if any(indicator in normalized for indicator in follow_up_indicators):
+        return "follow_up", False
+
+    # ---------------------------------------------------------
+    # Referential follow-ups
+    # ---------------------------------------------------------
+
+    referential_terms = (
+        "that",
+        "this",
+        "it",
+        "those",
+        "these",
+        "the above",
+        "the previous",
+        "mentioned earlier",
+    )
+
+    if any(
+        normalized.startswith(term + " ")
+        or normalized == term
+        for term in referential_terms
+    ):
+        return "follow_up", False
+
+    return "new_question", False
 # =============================================================
 # Contextualize Question
 # =============================================================
 
 def contextualize_question(state: RAGState) -> dict:
-    """Contextualize only high-confidence follow-up questions."""
+    """
+    Determine whether the incoming query is new, a follow-up, or a
+    conversation-control message.
+
+    Only follow-ups requiring conversational resolution invoke the
+    fast LLM contextualizer.
+    """
+
     with tracker.measure("contextualize_question"):
+
         history = state.get("messages", [])[-6:]
         question = state["question"]
 
-        if not history or not is_likely_follow_up(question, history):
+        intent, is_control = classify_query_intent(
+            question,
+            history,
+        )
+
+        print("\n" + "=" * 70)
+        print("QUERY INTENT")
+        print("=" * 70)
+        print(f"Question: {question}")
+        print(f"Intent: {intent}")
+        print(f"Control query: {is_control}")
+
+        # -----------------------------------------------------
+        # Control message
+        # -----------------------------------------------------
+
+        if is_control:
             return {
+                "query_intent": "control",
+                "query_is_control": True,
+                "contextualization_used": False,
                 "retrieval_query": question,
+                "trace": [{
+                    "stage": "contextualize_question",
+                    "question": question,
+                    "intent": "control",
+                    "contextualization_used": False,
+                }],
             }
+
+        # -----------------------------------------------------
+        # New standalone question
+        # -----------------------------------------------------
+
+        if intent == "new_question":
+            return {
+                "query_intent": "new_question",
+                "query_is_control": False,
+                "contextualization_used": False,
+                "retrieval_query": question,
+                "trace": [{
+                    "stage": "contextualize_question",
+                    "question": question,
+                    "intent": "new_question",
+                    "contextualization_used": False,
+                }],
+            }
+
+        # -----------------------------------------------------
+        # Follow-up
+        # -----------------------------------------------------
 
         history_text = "\n".join(
             f"{m.type}: {m.content}"
@@ -78,21 +229,33 @@ def contextualize_question(state: RAGState) -> dict:
         )
 
         prompt = (
-            "Given this conversation history and a follow-up input, "
-            "rewrite the follow-up into a standalone search query about "
-            "the document's content. "
-            "Return only the rewritten query, nothing else.\n\n"
-            f"History:\n{history_text}\n\n"
-            f"Follow-up: {question}"
+            "Rewrite the user's follow-up as a standalone search query "
+            "for the same document.\n\n"
+            "Rules:\n"
+            "1. Preserve the user's actual information need.\n"
+            "2. Use the previous conversation only to resolve references.\n"
+            "3. Do not introduce new topics.\n"
+            "4. Do not answer the question.\n"
+            "5. Return only the standalone search query.\n\n"
+            f"Conversation:\n{history_text}\n\n"
+            f"Follow-up:\n{question}"
         )
 
         result = fast_provider_chain.invoke(prompt)
 
+        rewritten = result.content.strip()
+
         return {
-            "retrieval_query": result.content.strip(),
+            "query_intent": "follow_up",
+            "query_is_control": False,
+            "contextualization_used": True,
+            "retrieval_query": rewritten,
             "trace": [{
                 "stage": "contextualize_question",
                 "question": question,
+                "intent": "follow_up",
+                "contextualization_used": True,
+                "rewritten_query": rewritten,
                 "history_turns": len(history),
             }],
         }
@@ -307,7 +470,7 @@ def assess_retrieval(state: RAGState) -> dict:
                 top_to_mean >= STRONG_TOP_TO_MEAN_RATIO
                 and gap_ratio >= STRONG_GAP_RATIO
             )
-
+            
             # The overview signal gets one additional path because the whole
             # document overview is specifically designed for document-level
             # evidence. We still require a meaningful score gap so tied/flat
@@ -470,39 +633,79 @@ def generate(state: RAGState) -> dict:
         _separator("6. GENERATION")
 
         documents = state.get("documents", [])
-        context = "\n\n".join(d.page_content for d in documents)
+
+        context = "\n\n".join(
+            d.page_content
+            for d in documents
+        )
+
         history = state.get("messages", [])[-6:]
+
         history_text = (
-            "\n".join(f"{m.type}: {m.content}" for m in history)
-            if history else "None"
+            "\n".join(
+                f"{m.type}: {m.content}"
+                for m in history
+            )
+            if history
+            else "None"
         )
 
         prompt = (
-            "Answer the question using only the provided context and prior conversation. "
-            "Follow the user's requested level of detail, structure, and style. "
-            "If the user asks for a detailed explanation, provide a detailed explanation. "
+            "Answer the question using only the provided context and "
+            "prior conversation. "
+            "Follow the user's requested level of detail, structure, "
+            "and style. "
+            "If the user asks for a detailed explanation, provide a "
+            "detailed explanation. "
             "If the user asks for a concise answer, keep it concise. "
-            "If the answer isn't supported by the context, say you don't know. "
-            "Do not omit important details needed to properly answer the question.\n\n"
+            "If the answer isn't supported by the context, say you "
+            "don't know. "
+            "Do not omit important details needed to properly answer "
+            "the question.\n\n"
             f"Prior conversation:\n{history_text}\n\n"
             f"Context:\n{context}\n\n"
             f"Question: {state['question']}"
         )
 
+        # ---------------------------------------------------------
+        # Generation diagnostics
+        # ---------------------------------------------------------
+
+        context_chars = len(context)
+        history_chars = len(history_text)
+        prompt_chars = len(prompt)
+
+        print(f"Context characters : {context_chars}")
+        print(f"History characters : {history_chars}")
+        print(f"Prompt characters  : {prompt_chars}")
+        print(f"Documents supplied : {len(documents)}")
+        print(f"History turns      : {len(history)}")
+
+        # ---------------------------------------------------------
+        # LLM generation
+        # ---------------------------------------------------------
+
         result = provider_chain.invoke(prompt)
+
         generation = result.content.strip()
+
+        output_chars = len(generation)
+
+        print(f"Output characters  : {output_chars}")
 
         return {
             "generation": generation,
             "trace": [{
                 "stage": "generate",
                 "question": state["question"],
-                "context_chars": len(context),
+                "context_chars": context_chars,
+                "history_chars": history_chars,
+                "prompt_chars": prompt_chars,
+                "output_chars": output_chars,
                 "history_turns": len(history),
                 "answer": generation,
             }],
         }
-
 
 # =============================================================
 # Hallucination Check

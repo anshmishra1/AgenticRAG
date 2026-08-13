@@ -60,6 +60,30 @@ def route_after_grading(state: RAGState) -> str:
     log_stage("route_after_grading", relevance_grade=grade, retry_count=retry_count, decision=decision)
     return decision
 
+def route_after_contextualization(state: RAGState) -> str:
+    """
+    Route control messages directly to record_turn.
+    All other queries continue to retrieval.
+    """
+
+    if state.get("query_is_control", False):
+        decision = "record_turn"
+    else:
+        decision = "retrieve"
+
+    print("\n" + "=" * 70)
+    print("GRAPH ROUTER: AFTER CONTEXTUALIZATION")
+    print("=" * 70)
+    print(f"Query intent: {state.get('query_intent')}")
+    print(f"ROUTE -> {decision}")
+
+    log_stage(
+        "route_after_contextualization",
+        query_intent=state.get("query_intent"),
+        decision=decision,
+    )
+
+    return decision
 
 def route_after_hallucination_check(state: RAGState) -> str:
     grade = state.get("hallucination_grade")

@@ -18,7 +18,9 @@ from agentic_rag.graph.edges import (
     route_after_grading,
     route_after_hallucination_check,
     route_after_retrieval_assessment,
+    route_after_contextualization,
 )
+
 from agentic_rag.graph.nodes import (
     assess_retrieval,
     contextualize_question,
@@ -57,7 +59,14 @@ def build_graph(checkpointer: BaseCheckpointSaver):
     # ---------------------------------------------------------
     # Retrieve -> AssessRetrieval
     # ---------------------------------------------------------
-    graph.add_edge("contextualize_question", "retrieve")
+    graph.add_conditional_edges(
+    "contextualize_question",
+    route_after_contextualization,
+    {
+        "retrieve": "retrieve",
+        "record_turn": "record_turn",
+    },
+)
     graph.add_edge("retrieve", "assess_retrieval")
     # graph.add_edge("retrieve", "grade_documents")
 
