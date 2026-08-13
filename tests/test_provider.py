@@ -1,7 +1,6 @@
-from agentic_rag.llm.provider import provider_chain
-
-
 def main() -> None:
+    from agentic_rag.llm.provider import provider_chain
+
     print("\n" + "=" * 60)
     print("LLM PROVIDER TEST")
     print("=" * 60)
