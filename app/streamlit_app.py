@@ -39,6 +39,14 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 
+if "documents" not in st.session_state:
+    st.session_state.documents = []
+
+
+if "active_document_id" not in st.session_state:
+    st.session_state.active_document_id = None
+
+
 # ============================================================
 # HTTP Session
 # ============================================================
@@ -52,6 +60,13 @@ def get_http_session() -> requests.Session:
 
 
 http = get_http_session()
+
+
+def load_documents() -> list[dict]:
+    """Fetch the documents registered by the FastAPI backend."""
+    response = http.get(f"{API_URL}/documents", timeout=30)
+    response.raise_for_status()
+    return response.json()
 
 
 # ============================================================
@@ -110,12 +125,94 @@ if uploaded_files and st.button("Ingest"):
 
         response.raise_for_status()
 
-    for result in response.json():
+    ingestion_results = response.json()
 
+    for result in ingestion_results:
         st.success(
             f"{result['filename']}: "
             f"{result['chunks_indexed']} chunks indexed"
         )
+
+    # Refresh the registry after ingestion.
+    try:
+        st.session_state.documents = load_documents()
+
+        # Automatically select the first newly ingested document when
+        # there was no active document before the upload.
+        if (
+            st.session_state.active_document_id is None
+            and ingestion_results
+        ):
+            st.session_state.active_document_id = ingestion_results[0]["document_id"]
+
+    except requests.RequestException as exc:
+        st.warning(
+            "Documents were ingested, but I could not refresh the document list."
+        )
+        st.error(str(exc))
+
+
+# ============================================================
+# Active Document
+# ============================================================
+
+st.subheader("Active document")
+
+try:
+    st.session_state.documents = load_documents()
+except requests.RequestException as exc:
+    st.warning("Could not load the document registry from FastAPI.")
+    st.error(str(exc))
+
+documents = st.session_state.documents
+
+if documents:
+    document_options = {
+        f"{doc['filename']} ({doc['chunk_count']} chunks)": doc["document_id"]
+        for doc in documents
+        if doc.get("document_id")
+    }
+
+    if document_options:
+        labels = list(document_options.keys())
+
+        current_label = next(
+            (
+                label
+                for label, document_id in document_options.items()
+                if document_id == st.session_state.active_document_id
+            ),
+            labels[0],
+        )
+
+        selected_label = st.selectbox(
+            "Questions will be retrieved only from this document:",
+            labels,
+            index=labels.index(current_label),
+        )
+
+        selected_document_id = document_options[selected_label]
+
+        if selected_document_id != st.session_state.active_document_id:
+            st.session_state.active_document_id = selected_document_id
+
+            # A document switch changes retrieval scope. Keeping the previous
+            # chat visible can be misleading, so start a clean scoped thread.
+            st.session_state.session_id = str(uuid.uuid4())
+            st.session_state.chat_history = []
+
+        st.caption(
+            f"Document ID: {st.session_state.active_document_id}"
+        )
+    else:
+        st.warning(
+            "The registry contains documents without document IDs. "
+            "Re-ingest them with the updated pipeline."
+        )
+        st.session_state.active_document_id = None
+else:
+    st.info("Upload and ingest a document before asking document-scoped questions.")
+    st.session_state.active_document_id = None
 
 
 # ============================================================
@@ -164,6 +261,12 @@ question = st.chat_input(
 
 if question:
 
+    if not st.session_state.active_document_id:
+        st.warning(
+            "Please upload and select an active document before asking a question."
+        )
+        st.stop()
+
     # --------------------------------------------------------
     # Display user question immediately
     # --------------------------------------------------------
@@ -200,6 +303,7 @@ if question:
                     json={
                         "question": question,
                         "session_id": st.session_state.session_id,
+                        "document_id": st.session_state.active_document_id,
                     },
                     timeout=120,
                 )

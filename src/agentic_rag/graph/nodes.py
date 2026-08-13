@@ -1,8 +1,18 @@
-"""Node functions for the corrective RAG pipeline.
+"""Node functions for the optimized corrective RAG pipeline.
 
-Every node prints diagnostic information as it runs, appends a small entry to state["trace"],
-and measures execution time using PerformanceTracker.
+Optimization introduced in this version:
+- Retrieval now produces an evidence profile from the scores/metadata it already has.
+- A deterministic retrieval assessment decides whether an LLM relevance grader is
+  actually necessary.
+- Strong retrieval results go directly to generation.
+- Ambiguous/weak retrieval results keep the existing corrective grading + rewrite loop.
+- The LLM grader evaluates the strongest candidates instead of blindly grading every
+  retrieved chunk.
+
+The existing document_id-scoped retrieval and provider tiers are preserved.
 """
+from __future__ import annotations
+
 import json
 import logging
 
@@ -10,7 +20,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from agentic_rag.graph.state import RAGState
 from agentic_rag.llm.provider import provider_chain, fast_provider_chain
-from agentic_rag.retrieval.vectorstore import get_overview_retriever, get_retriever, retrieve_with_scores
+from agentic_rag.retrieval.vectorstore import retrieve_with_scores
 from agentic_rag.graph.query_utils import is_likely_follow_up
 from agentic_rag.retrieval.confidence import classify_retrieval_confidence
 from agentic_rag.core.timing import PerformanceTracker
@@ -19,11 +29,20 @@ logger = logging.getLogger(__name__)
 tracker = PerformanceTracker()
 
 
+# Conservative relative thresholds. These are intentionally NOT absolute
+# similarity-score thresholds because the current retrieval confidence is
+# uncalibrated across queries.
+STRONG_TOP_TO_MEAN_RATIO = 1.10
+STRONG_GAP_RATIO = 0.02
+STRONG_OVERVIEW_MARGIN = 0.02
+MAX_GRADING_CANDIDATES = 4
+
+
 # =============================================================
 # Debug helpers
 # =============================================================
 
-def _separator(title: str):
+def _separator(title: str) -> None:
     print("\n" + "=" * 70)
     print(title)
     print("=" * 70)
@@ -38,9 +57,12 @@ def _preview(text: str, length: int = 500) -> str:
 # Contextualize Question
 # =============================================================
 
+# =============================================================
+# Contextualize Question
+# =============================================================
+
 def contextualize_question(state: RAGState) -> dict:
     """Contextualize only high-confidence follow-up questions."""
-    tracker = PerformanceTracker()
     with tracker.measure("contextualize_question"):
         history = state.get("messages", [])[-6:]
         question = state["question"]
@@ -64,7 +86,7 @@ def contextualize_question(state: RAGState) -> dict:
             f"Follow-up: {question}"
         )
 
-        result = provider_chain.invoke(prompt)
+        result = fast_provider_chain.invoke(prompt)
 
         return {
             "retrieval_query": result.content.strip(),
@@ -77,7 +99,7 @@ def contextualize_question(state: RAGState) -> dict:
 
 
 # =============================================================
-# Retrieval
+# Retrieval metrics
 # =============================================================
 
 def calculate_retrieval_metrics(scores: list[float]) -> dict:
@@ -87,37 +109,84 @@ def calculate_retrieval_metrics(scores: list[float]) -> dict:
             "second_score": 0.0,
             "score_gap": 0.0,
             "mean_score": 0.0,
+            "top_to_mean_ratio": 0.0,
+            "gap_ratio": 0.0,
         }
 
-    ordered = sorted(scores, reverse=True)
+    ordered = sorted((float(score) for score in scores), reverse=True)
     top_score = ordered[0]
     second_score = ordered[1] if len(ordered) > 1 else ordered[0]
+    mean_score = sum(ordered) / len(ordered)
+    score_gap = top_score - second_score
+
+    # Scores are assumed to be similarity scores where larger is better, as
+    # returned by PineconeVectorStore.similarity_search_with_score().
+    top_to_mean_ratio = top_score / mean_score if mean_score > 0 else 0.0
+    gap_ratio = score_gap / abs(top_score) if top_score != 0 else 0.0
 
     return {
         "top_score": top_score,
         "second_score": second_score,
-        "score_gap": top_score - second_score,
-        "mean_score": sum(scores) / len(scores),
+        "score_gap": score_gap,
+        "mean_score": mean_score,
+        "top_to_mean_ratio": top_to_mean_ratio,
+        "gap_ratio": gap_ratio,
     }
 
 
+def _top_score_for_type(results: list[tuple], chunk_type: str) -> float | None:
+    scores = [
+        float(score)
+        for doc, score in results
+        if doc.metadata.get("type") == chunk_type
+    ]
+    return max(scores) if scores else None
+
+
+# =============================================================
+# Retrieval
+# =============================================================
+
 def retrieve(state: RAGState) -> dict:
-    tracker = PerformanceTracker()
     with tracker.measure("retrieve"):
         _separator("2. RETRIEVAL")
 
         query = state.get("retrieval_query") or state["question"]
         print(f"Query sent to retriever:\n{query}")
 
+        document_id = state.get("document_id")
+
+        if document_id:
+            overview_filter = {
+                "$and": [
+                    {"document_id": {"$eq": document_id}},
+                    {"type": {"$eq": "overview"}},
+                ]
+            }
+            content_filter = {
+                "$and": [
+                    {"document_id": {"$eq": document_id}},
+                    {"type": {"$eq": "content"}},
+                ]
+            }
+            print(f"Document scope: {document_id}")
+        else:
+            # Backward-compatible fallback. Normal application queries should
+            # provide document_id when the user is asking about one document.
+            overview_filter = {"type": {"$eq": "overview"}}
+            content_filter = None
+            print("Document scope: GLOBAL (no document_id supplied)")
+
         overview_results = retrieve_with_scores(
             query=query,
             k=2,
-            filter={"type": {"$eq": "overview"}},
+            filter=overview_filter,
         )
 
         content_results = retrieve_with_scores(
             query=query,
             k=5,
+            filter=content_filter,
         )
 
         results = overview_results + content_results
@@ -128,14 +197,14 @@ def retrieve(state: RAGState) -> dict:
 
         overview_docs_count = len(overview_results)
         content_docs_count = len(content_results)
-        top_score = max(scores) if scores else 0.0
+        metrics = calculate_retrieval_metrics(scores)
+        top_score = metrics["top_score"]
         confidence = classify_retrieval_confidence(scores)
+        overview_top_score = _top_score_for_type(results, "overview")
+        content_top_score = _top_score_for_type(results, "content")
 
         print(f"\nOverview chunks retrieved: {overview_docs_count}")
         print(f"Content chunks retrieved: {content_docs_count}")
-
-        if not docs:
-            print("WARNING: No documents were retrieved.")
 
         for i, doc in enumerate(docs, start=1):
             print("\n" + "-" * 60)
@@ -144,35 +213,153 @@ def retrieve(state: RAGState) -> dict:
             print(f"Metadata: {doc.metadata}")
             print(f"\nContent preview:\n{_preview(doc.page_content)}")
 
-        metrics = calculate_retrieval_metrics(scores)
-
         logger.info(
-            "RETRIEVAL | query=%r | scores=%s | top=%.4f | second=%.4f | gap=%.4f | mean=%.4f",
+            "RETRIEVAL | query=%r | scores=%s | top=%.4f | second=%.4f | "
+            "gap=%.4f | mean=%.4f | top/mean=%.4f | gap_ratio=%.4f",
             query,
             [round(score, 4) for score in scores],
             metrics["top_score"],
             metrics["second_score"],
             metrics["score_gap"],
             metrics["mean_score"],
+            metrics["top_to_mean_ratio"],
+            metrics["gap_ratio"],
         )
 
         return {
             "documents": docs,
             "retrieval_scores": scores,
             "retrieval_top_score": top_score,
+            "retrieval_second_score": metrics["second_score"],
+            "retrieval_score_gap": metrics["score_gap"],
+            "retrieval_mean_score": metrics["mean_score"],
+            "retrieval_top_to_mean_ratio": metrics["top_to_mean_ratio"],
+            "retrieval_gap_ratio": metrics["gap_ratio"],
             "retrieval_confidence": confidence,
-            "trace": [
-                {
-                    "stage": "retrieve",
-                    "retrieval_query": query,
-                    "overview_docs": overview_docs_count,
-                    "content_docs": content_docs_count,
-                    "sources": [d.metadata.get("source") for d in docs],
-                    "scores": scores,
-                    "top_score": top_score,
-                    "retrieval_confidence": confidence,
-                }
-            ],
+            "retrieval_overview_top_score": overview_top_score,
+            "retrieval_content_top_score": content_top_score,
+            "trace": [{
+                "stage": "retrieve",
+                "retrieval_query": query,
+                "document_id": document_id,
+                "overview_docs": overview_docs_count,
+                "content_docs": content_docs_count,
+                "sources": [d.metadata.get("source") for d in docs],
+                "scores": scores,
+                "top_score": top_score,
+                "second_score": metrics["second_score"],
+                "score_gap": metrics["score_gap"],
+                "mean_score": metrics["mean_score"],
+                "top_to_mean_ratio": metrics["top_to_mean_ratio"],
+                "gap_ratio": metrics["gap_ratio"],
+                "retrieval_confidence": confidence,
+                "overview_top_score": overview_top_score,
+                "content_top_score": content_top_score,
+            }],
+        }
+
+
+# =============================================================
+# Retrieval assessment — NEW optimization layer
+# =============================================================
+
+def assess_retrieval(state: RAGState) -> dict:
+    """Decide whether an LLM relevance grader is necessary.
+
+    This is deliberately deterministic. The current retrieval confidence is
+    not calibrated, so we avoid absolute score cutoffs and use relative
+    evidence signals instead.
+
+    Strong evidence -> generation directly.
+    Ambiguous/weak evidence -> existing LLM relevance grading.
+    """
+    with tracker.measure("assess_retrieval"):
+        _separator("3. RETRIEVAL ASSESSMENT")
+
+        documents = state.get("documents", [])
+        scores = [float(score) for score in state.get("retrieval_scores", [])]
+
+        if not documents or not scores:
+            decision = "grade"
+            reason = "no_retrieval_candidates"
+            evidence_strength = "weak"
+            strong_evidence = False
+        else:
+            metrics = calculate_retrieval_metrics(scores)
+            top_score = metrics["top_score"]
+            second_score = metrics["second_score"]
+            top_to_mean = metrics["top_to_mean_ratio"]
+            gap_ratio = metrics["gap_ratio"]
+
+            top_doc = documents[0]
+            top_type = top_doc.metadata.get("type")
+            overview_top = state.get("retrieval_overview_top_score")
+            content_top = state.get("retrieval_content_top_score")
+
+            overview_dominant = (
+                top_type == "overview"
+                and overview_top is not None
+                and content_top is not None
+                and overview_top >= content_top * (1.0 + STRONG_OVERVIEW_MARGIN)
+            )
+
+            strong_by_distribution = (
+                top_to_mean >= STRONG_TOP_TO_MEAN_RATIO
+                and gap_ratio >= STRONG_GAP_RATIO
+            )
+
+            # The overview signal gets one additional path because the whole
+            # document overview is specifically designed for document-level
+            # evidence. We still require a meaningful score gap so tied/flat
+            # results (e.g. corpus-count questions) remain conservative.
+            strong_evidence = strong_by_distribution or (
+                overview_dominant and gap_ratio >= STRONG_GAP_RATIO
+            )
+
+            if strong_evidence:
+                decision = "generate"
+                evidence_strength = "strong"
+                if overview_dominant:
+                    reason = "overview_dominant_with_clear_margin"
+                else:
+                    reason = "strong_score_distribution"
+            else:
+                decision = "grade"
+                evidence_strength = "ambiguous"
+                if gap_ratio < STRONG_GAP_RATIO:
+                    reason = "top_candidates_too_close"
+                elif top_to_mean < STRONG_TOP_TO_MEAN_RATIO:
+                    reason = "weak_top_candidate_separation"
+                else:
+                    reason = "retrieval_requires_semantic_grading"
+
+            print(f"Top score: {top_score:.4f}")
+            print(f"Second score: {second_score:.4f}")
+            print(f"Top/mean ratio: {top_to_mean:.4f}")
+            print(f"Gap ratio: {gap_ratio:.4f}")
+            print(f"Top document type: {top_type}")
+            print(f"Overview dominant: {overview_dominant}")
+
+        print(f"Evidence strength: {evidence_strength}")
+        print(f"Retrieval decision: {decision}")
+        print(f"Decision reason: {reason}")
+
+        return {
+            "retrieval_decision": decision,
+            "retrieval_evidence_strength": evidence_strength,
+            "retrieval_decision_reason": reason,
+            "trace": [{
+                "stage": "assess_retrieval",
+                "decision": decision,
+                "evidence_strength": evidence_strength,
+                "reason": reason,
+                "top_score": state.get("retrieval_top_score", 0.0),
+                "second_score": state.get("retrieval_second_score", 0.0),
+                "score_gap": state.get("retrieval_score_gap", 0.0),
+                "mean_score": state.get("retrieval_mean_score", 0.0),
+                "top_to_mean_ratio": state.get("retrieval_top_to_mean_ratio", 0.0),
+                "gap_ratio": state.get("retrieval_gap_ratio", 0.0),
+            }],
         }
 
 
@@ -181,23 +368,39 @@ def retrieve(state: RAGState) -> dict:
 # =============================================================
 
 def grade_documents(state: RAGState) -> dict:
-    tracker = PerformanceTracker()
+    """Use the fast LLM only for ambiguous retrieval results."""
     with tracker.measure("grade_documents"):
-        _separator("3. DOCUMENT RELEVANCE GRADING")
+        _separator("4. DOCUMENT RELEVANCE GRADING")
 
         documents = state.get("documents", [])
+        scores = state.get("retrieval_scores", [])
         query = state.get("retrieval_query") or state["question"]
 
-        print(f"Question/query being graded:\n{query}")
-        print(f"Number of retrieved documents: {len(documents)}")
+        # Retrieval already sorted candidates by score. Keep the grader prompt
+        # bounded and focused on the strongest evidence instead of all chunks.
+        candidates = list(zip(documents, scores))[:MAX_GRADING_CANDIDATES]
+        preview = [
+            {
+                "rank": idx,
+                "score": round(float(score), 4),
+                "type": doc.metadata.get("type"),
+                "source": doc.metadata.get("source"),
+                "content": doc.page_content[:500],
+            }
+            for idx, (doc, score) in enumerate(candidates, start=1)
+        ]
 
-        preview = [d.page_content[:300] for d in documents]
+        print(f"Question/query being graded:\n{query}")
+        print(f"Candidates sent to grader: {len(preview)}")
 
         prompt = (
-            "You grade whether retrieved context is relevant to a question. "
-            "Answer with exactly one word: 'relevant' or 'irrelevant'.\n\n"
-            f"Question: {query}\n"
-            f"Context: {preview}"
+            "You are a retrieval relevance grader. Determine whether the retrieved "
+            "evidence contains enough information to answer the user's query. "
+            "Consider the candidate type metadata: an 'overview' chunk represents "
+            "whole-document evidence, while a 'content' chunk represents specific "
+            "document content. Return exactly one word: 'relevant' or 'irrelevant'.\n\n"
+            f"Question: {query}\n\n"
+            f"Retrieved candidates:\n{json.dumps(preview, ensure_ascii=False, default=str)}"
         )
 
         result = fast_provider_chain.invoke(prompt)
@@ -217,6 +420,7 @@ def grade_documents(state: RAGState) -> dict:
                 "stage": "grade_documents",
                 "query": query,
                 "doc_count": len(documents),
+                "graded_candidates": len(preview),
                 "raw_grade": raw_grade,
                 "normalized_grade": grade,
             }],
@@ -228,16 +432,16 @@ def grade_documents(state: RAGState) -> dict:
 # =============================================================
 
 def rewrite_query(state: RAGState) -> dict:
-    tracker = PerformanceTracker()
     with tracker.measure("rewrite_query"):
-        _separator("4. QUERY REWRITE")
+        _separator("5. QUERY REWRITE")
 
         current = state.get("retrieval_query") or state["question"]
         retry_count = state.get("retry_count", 0)
 
         prompt = (
             "Rewrite this search query to be clearer and better suited for "
-            "semantic search. Return only the rewritten query, nothing else.\n\n"
+            "semantic search. Preserve the user's actual information need. "
+            "Return only the rewritten query, nothing else.\n\n"
             f"Query: {current}"
         )
 
@@ -262,9 +466,8 @@ def rewrite_query(state: RAGState) -> dict:
 # =============================================================
 
 def generate(state: RAGState) -> dict:
-    tracker = PerformanceTracker()
     with tracker.measure("generate"):
-        _separator("5. GENERATION")
+        _separator("6. GENERATION")
 
         documents = state.get("documents", [])
         context = "\n\n".join(d.page_content for d in documents)
@@ -306,9 +509,8 @@ def generate(state: RAGState) -> dict:
 # =============================================================
 
 def check_hallucination(state: RAGState) -> dict:
-    tracker = PerformanceTracker()
     with tracker.measure("check_hallucination"):
-        _separator("6. HALLUCINATION CHECK")
+        _separator("7. HALLUCINATION CHECK")
 
         documents = state.get("documents", [])
         context = "\n\n".join(d.page_content for d in documents)
@@ -329,12 +531,18 @@ def check_hallucination(state: RAGState) -> dict:
             else "hallucinated"
         )
 
+        hallucination_retry_count = state.get("hallucination_retry_count", 0)
+        if grade == "hallucinated":
+            hallucination_retry_count += 1
+
         return {
             "hallucination_grade": grade,
+            "hallucination_retry_count": hallucination_retry_count,
             "trace": [{
                 "stage": "check_hallucination",
                 "raw_grade": raw_grade,
                 "normalized_grade": grade,
+                "hallucination_retry_count": hallucination_retry_count,
             }],
         }
 
@@ -344,12 +552,15 @@ def check_hallucination(state: RAGState) -> dict:
 # =============================================================
 
 def record_turn(state: RAGState) -> dict:
-    _separator("7. RECORD TURN")
+    _separator("8. RECORD TURN")
 
     final_entry = {
         "stage": "record_turn",
         "final_route": "end",
         "retry_count": state.get("retry_count", 0),
+        "retrieval_decision": state.get("retrieval_decision"),
+        "retrieval_evidence_strength": state.get("retrieval_evidence_strength"),
+        "retrieval_decision_reason": state.get("retrieval_decision_reason"),
     }
 
     full_trace = state.get("trace", []) + [final_entry]
@@ -357,7 +568,6 @@ def record_turn(state: RAGState) -> dict:
     _separator("STRUCTURED TRACE SUMMARY (full request, end to end)")
     print(json.dumps(full_trace, indent=2, default=str))
 
-    # Print the full timing summary across measured pipeline nodes
     tracker.summary()
 
     return {

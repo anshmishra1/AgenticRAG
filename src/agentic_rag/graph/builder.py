@@ -10,16 +10,19 @@ contextualize -> retrieve -> grade
                            └── irrelevant -> rewrite -> retrieve
 """
 
+from langgraph import graph
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 
 from agentic_rag.graph.edges import (
     route_after_grading,
     route_after_hallucination_check,
+    route_after_retrieval_assessment,
 )
 from agentic_rag.graph.nodes import (
-    check_hallucination,
+    assess_retrieval,
     contextualize_question,
+    check_hallucination,
     generate,
     grade_documents,
     record_turn,
@@ -36,9 +39,9 @@ def build_graph(checkpointer: BaseCheckpointSaver):
     # ---------------------------------------------------------
     # Nodes
     # ---------------------------------------------------------
-
     graph.add_node("contextualize_question", contextualize_question)
     graph.add_node("retrieve", retrieve)
+    graph.add_node("assess_retrieval", assess_retrieval)
     graph.add_node("grade_documents", grade_documents)
     graph.add_node("rewrite_query", rewrite_query)
     graph.add_node("generate", generate)
@@ -52,22 +55,29 @@ def build_graph(checkpointer: BaseCheckpointSaver):
     graph.set_entry_point("contextualize_question")
 
     # ---------------------------------------------------------
-    # Contextualization -> Retrieval
+    # Retrieve -> AssessRetrieval
     # ---------------------------------------------------------
+    graph.add_edge("contextualize_question", "retrieve")
+    graph.add_edge("retrieve", "assess_retrieval")
+    # graph.add_edge("retrieve", "grade_documents")
 
-    graph.add_edge(
-        "contextualize_question",
-        "retrieve",
+    graph.add_conditional_edges(
+        "assess_retrieval",
+        route_after_retrieval_assessment,
+        {
+            "generate": "generate",
+            "grade_documents": "grade_documents",
+        },
     )
 
     # ---------------------------------------------------------
     # Retrieval -> Relevance Grading
     # ---------------------------------------------------------
 
-    graph.add_edge(
-        "retrieve",
-        "grade_documents",
-    )
+    # graph.add_edge(
+    #     "retrieve",
+    #     "grade_documents",
+    # )
 
     # ---------------------------------------------------------
     # Relevance routing
@@ -112,7 +122,6 @@ def build_graph(checkpointer: BaseCheckpointSaver):
             "end": "record_turn",
         },
     )
-
     # ---------------------------------------------------------
     # Record conversation
     # ---------------------------------------------------------

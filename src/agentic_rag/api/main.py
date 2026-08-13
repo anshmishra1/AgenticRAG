@@ -37,6 +37,7 @@ app = FastAPI(title="Agentic RAG API", lifespan=lifespan)
 class QueryRequest(BaseModel):
     question: str
     session_id: str = "default"
+    document_id: str | None = None
 
 
 class QueryResponse(BaseModel):
@@ -46,14 +47,30 @@ class QueryResponse(BaseModel):
 
 class IngestResult(BaseModel):
     filename: str
+    document_id: str
     chunks_indexed: int
 
 
 @app.post("/query", response_model=QueryResponse)
 def query(request: QueryRequest, http_request: Request) -> QueryResponse:
     config = {"configurable": {"thread_id": request.session_id}}
+    initial_state = {
+        "question": request.question,
+        "document_id": request.document_id,
+        "retrieval_query": None,
+        "documents": [],
+        "generation": None,
+        "relevance_grade": None,
+        "hallucination_grade": None,
+        "retry_count": 0,
+        "hallucination_retry_count": 0,
+        "retrieval_scores": [],
+        "trace": [],
+    }
+
     result = http_request.app.state.rag_graph.invoke(
-        {"question": request.question, "retry_count": 0}, config=config
+        initial_state,
+        config=config,
     )
     return QueryResponse(
         answer=result["generation"],
@@ -71,9 +88,25 @@ async def ingest(files: list[UploadFile] = File(...)) -> list[IngestResult]:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             shutil.copyfileobj(upload.file, tmp)
             tmp_path = tmp.name
+
         try:
-            chunk_count = ingest_file(tmp_path, display_name=upload.filename)
-            results.append(IngestResult(filename=upload.filename or "unknown", chunks_indexed=chunk_count))
+            # Keep the API response aligned with the same content-based ID
+            # used by ingestion/pipeline.py.
+            from agentic_rag.ingestion.pipeline import _document_id
+
+            document_id = _document_id(Path(tmp_path))
+            chunk_count = ingest_file(
+                tmp_path,
+                display_name=upload.filename,
+            )
+
+            results.append(
+                IngestResult(
+                    filename=upload.filename or "unknown",
+                    document_id=document_id,
+                    chunks_indexed=chunk_count,
+                )
+            )
         except (ValueError, NotImplementedError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:

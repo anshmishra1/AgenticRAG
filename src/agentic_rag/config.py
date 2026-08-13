@@ -66,10 +66,26 @@ class Settings(BaseSettings):
     # openrouter
     # bedrock
     #
-    # We will make this configurable in provider.py.
+    # This order is used by ProviderChain for both model tiers.
+    # Tier-specific ordering can be introduced later if required.
     provider_order: str = (
         "cerebras,groq,nvidia,openrouter"
     )
+
+    # ---------------------------------------------------------
+    # LLM Request Timeouts
+    # ---------------------------------------------------------
+    # FAST tier is used for short operations such as:
+    # contextualization, grading, query rewriting, and
+    # hallucination checks.
+    #
+    # PRIMARY tier is used for final answer generation and
+    # therefore receives a longer timeout.
+    #
+    # These values are centralized here so the provider layer
+    # does not hardcode timeout policies.
+    fast_llm_timeout: float = 15.0
+    primary_llm_timeout: float = 45.0
 
     # Bedrock is deliberately disabled for now.
     bedrock_enabled: bool = False
