@@ -6,3 +6,10 @@ mlruns/
 *.egg-info/
 .venv/
 temp.pdf
+dot_md/
+logs/
+requirements.txt
+requirement_file.txt 
+rough.ipynb
+DockerFile
+docker-compose.yml
