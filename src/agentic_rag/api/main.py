@@ -77,9 +77,15 @@ def query(request: QueryRequest, http_request: Request) -> QueryResponse:
     }
 
     result = http_request.app.state.rag_graph.invoke(
-        initial_state,
+        {
+            "question": request.question,
+            "document_id": request.document_id,
+            "retry_count": 0,
+            "hallucination_retry_count": 0,
+        },
         config=config,
     )
+    
     return QueryResponse(
         answer=result["generation"],
         grounded=result.get("hallucination_grade") == "grounded",
