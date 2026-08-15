@@ -1,21 +1,30 @@
-"""Assemble the corrective Agentic RAG StateGraph."""
+"""Assembles the corrective RAG StateGraph.
 
-from __future__ import annotations
+Flow:
 
+contextualize -> retrieve -> grade
+                           ├── relevant -> generate -> hallucination check
+                           │                              ├── grounded -> record -> END
+                           │                              └── hallucinated -> generate
+                           │
+                           └── irrelevant -> rewrite -> retrieve
+"""
+
+from langgraph import graph
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 
 from agentic_rag.graph.edges import (
-    route_after_contextualization,
-    route_after_generate,
     route_after_grading,
     route_after_hallucination_check,
     route_after_retrieval_assessment,
+    route_after_contextualization,
 )
+
 from agentic_rag.graph.nodes import (
     assess_retrieval,
-    check_hallucination,
     contextualize_question,
+    check_hallucination,
     generate,
     grade_documents,
     record_turn,
@@ -25,92 +34,41 @@ from agentic_rag.graph.nodes import (
 from agentic_rag.graph.state import RAGState
 
 
-def build_graph(
-    checkpointer: BaseCheckpointSaver,
-):
-    """Build and compile the corrective RAG graph."""
+def build_graph(checkpointer: BaseCheckpointSaver):
 
     graph = StateGraph(RAGState)
 
     # ---------------------------------------------------------
     # Nodes
     # ---------------------------------------------------------
-
-    graph.add_node(
-        "contextualize_question",
-        contextualize_question,
-    )
-
-    graph.add_node(
-        "retrieve",
-        retrieve,
-    )
-
-    graph.add_node(
-        "assess_retrieval",
-        assess_retrieval,
-    )
-
-    graph.add_node(
-        "grade_documents",
-        grade_documents,
-    )
-
-    graph.add_node(
-        "rewrite_query",
-        rewrite_query,
-    )
-
-    graph.add_node(
-        "generate",
-        generate,
-    )
-
-    graph.add_node(
-        "check_hallucination",
-        check_hallucination,
-    )
-
-    graph.add_node(
-        "record_turn",
-        record_turn,
-    )
+    graph.add_node("contextualize_question", contextualize_question)
+    graph.add_node("retrieve", retrieve)
+    graph.add_node("assess_retrieval", assess_retrieval)
+    graph.add_node("grade_documents", grade_documents)
+    graph.add_node("rewrite_query", rewrite_query)
+    graph.add_node("generate", generate)
+    graph.add_node("check_hallucination", check_hallucination)
+    graph.add_node("record_turn", record_turn)
 
     # ---------------------------------------------------------
-    # Entry
+    # Entry point
     # ---------------------------------------------------------
 
     graph.set_entry_point("contextualize_question")
 
     # ---------------------------------------------------------
-    # Contextualization
+    # Retrieve -> AssessRetrieval
     # ---------------------------------------------------------
-
     graph.add_conditional_edges(
-        "contextualize_question",
-        route_after_contextualization,
-        {
-            "retrieve": "retrieve",
-            "record_turn": "record_turn",
-        },
-    )
-
-    # ---------------------------------------------------------
-    # Retrieval
-    # ---------------------------------------------------------
-
-    graph.add_edge(
-        "retrieve",
-        "assess_retrieval",
-    )
-
-    # ---------------------------------------------------------
-    # Three-way evidence gate
-    #
-    # HIGH       -> generate
-    # AMBIGUOUS  -> grade_documents
-    # LOW        -> rewrite_query
-    # ---------------------------------------------------------
+    "contextualize_question",
+    route_after_contextualization,
+    {
+        "retrieve": "retrieve",
+        "record_turn": "record_turn",
+    },
+)
+    graph.add_edge("retrieve", "assess_retrieval")
+    # graph.add_edge("retrieve", "grade_documents")
 
     graph.add_conditional_edges(
         "assess_retrieval",
@@ -123,20 +81,29 @@ def build_graph(
     )
 
     # ---------------------------------------------------------
-    # Semantic relevance grading
+    # Retrieval -> Relevance Grading
+    # ---------------------------------------------------------
+
+    # graph.add_edge(
+    #     "retrieve",
+    #     "grade_documents",
+    # )
+
+    # ---------------------------------------------------------
+    # Relevance routing
     # ---------------------------------------------------------
 
     graph.add_conditional_edges(
         "grade_documents",
         route_after_grading,
         {
-            "generate": "generate",
             "rewrite_query": "rewrite_query",
+            "generate": "generate",
         },
     )
 
     # ---------------------------------------------------------
-    # Corrective retrieval
+    # Corrective retrieval loop
     # ---------------------------------------------------------
 
     graph.add_edge(
@@ -145,20 +112,16 @@ def build_graph(
     )
 
     # ---------------------------------------------------------
-    # Generation
+    # Generation -> Hallucination Check
     # ---------------------------------------------------------
 
-    graph.add_conditional_edges(
+    graph.add_edge(
         "generate",
-        route_after_generate,
-        {
-            "check_hallucination": "check_hallucination",
-            "record_turn": "record_turn",
-        },
+        "check_hallucination",
     )
 
     # ---------------------------------------------------------
-    # Hallucination verification
+    # Hallucination routing
     # ---------------------------------------------------------
 
     graph.add_conditional_edges(
@@ -169,9 +132,8 @@ def build_graph(
             "end": "record_turn",
         },
     )
-
     # ---------------------------------------------------------
-    # Conversation persistence
+    # Record conversation
     # ---------------------------------------------------------
 
     graph.add_edge(
@@ -179,6 +141,4 @@ def build_graph(
         END,
     )
 
-    return graph.compile(
-        checkpointer=checkpointer,
-    )
+    return graph.compile(checkpointer=checkpointer)

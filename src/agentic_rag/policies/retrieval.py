@@ -1,217 +1,95 @@
-"""Retrieval evidence policies.
+"""Retrieval confidence policy.
 
-The retrieval policy deliberately uses a three-way decision:
+Replaces the old binary check (strong -> skip grading / else -> grade) with a
+three-way gate:
 
-    HIGH       -> generate
-    AMBIGUOUS  -> LLM relevance grader
-    LOW        -> corrective query rewrite
+  1. Below an ABSOLUTE score floor  -> weak.    Skip grading, go straight to
+     query rewrite. No point asking an LLM to grade context we're already
+     confident is unrelated to the question.
+  2. Above the floor AND a confident relative shape -> strong. Skip grading,
+     go straight to generation.
+  3. Everything in between -> ambiguous. Defer to the LLM grader - this is
+     exactly where a cheap heuristic is least reliable, so don't trust it here.
 
-The absolute thresholds are configuration values and are expected to be
-calibrated from representative retrieval observations.
+Why an absolute floor was missing before, and why that mattered: the old
+check only looked at RELATIVE shape (top-to-mean ratio, gap ratio). Six
+uniformly weak, barely-related scores can still produce a "confident-looking"
+ratio purely because they're not identical to each other - there's nothing in
+a relative-only check that can tell "these are strong matches" apart from
+"these are six weak matches where one happens to be less weak than the rest."
+A real production trace caught this exactly: a query against the wrong
+document returned scores of [0.23, 0.17, 0.15, 0.15, 0.13, -0.06] and was
+still classified "strong" by the old logic, because the ratios looked fine.
 
-RAGAS is intentionally not used here. RAGAS evaluates generation quality;
-this module decides how raw retrieval evidence should be routed.
+The absolute thresholds below (retrieval_min_top_score=0.35,
+retrieval_strong_top_score=0.55) are calibrated from that trace's real score
+clusters: genuine matches scored 0.55-0.63, genuine mismatches scored
+0.04-0.23. Treat these as a starting point backed by one real trace, not a
+rigorous calibration - see scripts/calibrate_retrieval.py to refine them
+against a larger labeled set.
 """
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from agentic_rag.config import settings
 
 
-@dataclass(frozen=True)
-class RetrievalMetrics:
-    """Derived metrics from a ranked retrieval score list."""
+def assess_retrieval_confidence(
+    metrics: dict,
+    top_doc_type: str | None,
+    overview_top_score: float | None,
+    content_top_score: float | None,
+    retry_count: int = 0,
+) -> dict:
+    """Returns {"decision": ..., "evidence_strength": ..., "reason": ...}.
 
-    top_score: float
-    second_score: float
-    score_gap: float
-    mean_score: float
-    top_to_mean_ratio: float
-    gap_ratio: float
-
-
-def calculate_retrieval_metrics(
-    scores: list[float],
-) -> RetrievalMetrics:
-    """Calculate stable retrieval metrics from similarity scores."""
-
-    if not scores:
-        return RetrievalMetrics(
-            top_score=0.0,
-            second_score=0.0,
-            score_gap=0.0,
-            mean_score=0.0,
-            top_to_mean_ratio=0.0,
-            gap_ratio=0.0,
-        )
-
-    ordered = sorted(
-        (float(score) for score in scores),
-        reverse=True,
-    )
-
-    top_score = ordered[0]
-
-    second_score = (
-        ordered[1]
-        if len(ordered) > 1
-        else ordered[0]
-    )
-
-    mean_score = sum(ordered) / len(ordered)
-    score_gap = top_score - second_score
-
-    top_to_mean_ratio = (
-        top_score / mean_score
-        if mean_score > 0
-        else 0.0
-    )
-
-    gap_ratio = (
-        score_gap / top_score
-        if top_score > 0
-        else 0.0
-    )
-
-    return RetrievalMetrics(
-        top_score=top_score,
-        second_score=second_score,
-        score_gap=score_gap,
-        mean_score=mean_score,
-        top_to_mean_ratio=top_to_mean_ratio,
-        gap_ratio=gap_ratio,
-    )
-
-
-def _cfg_value(
-    cfg: Any,
-    name: str,
-    default: float,
-) -> float:
-    """Read a numeric setting safely."""
-
-    value = getattr(cfg, name, default)
-
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def classify_retrieval_confidence(
-    metrics: RetrievalMetrics,
-    *,
-    top_doc_type: str | None = None,
-    overview_top_score: float | None = None,
-    content_top_score: float | None = None,
-    cfg: Any,
-) -> tuple[str, str, str]:
-    """Return ``(decision, evidence_strength, reason)``.
-
-    Decisions:
-        generate
-        grade_documents
-        rewrite_query
-
-    The low gate is evaluated first because a strong relative score
-    distribution must never override an absolutely weak retrieval score.
-
-    The high gate requires the calibrated strong-score boundary plus
-    supporting relative evidence, or a clearly dominant overview result.
-
-    Everything else remains ambiguous and is delegated to the LLM grader.
+    decision is one of "generate" | "grade" | "rewrite_query".
+    retry_count guards against the weak-evidence branch looping forever:
+    once max_retries is hit, weak evidence falls through to "grade" (the LLM
+    gets one last say) instead of rewriting indefinitely.
     """
-
-    min_top_score = _cfg_value(
-        cfg,
-        "retrieval_min_top_score",
-        0.35,
-    )
-
-    strong_top_score = _cfg_value(
-        cfg,
-        "retrieval_strong_top_score",
-        0.55,
-    )
-
-    min_top_to_mean = _cfg_value(
-        cfg,
-        "retrieval_min_top_to_mean_ratio",
-        1.20,
-    )
-
-    min_gap_ratio = _cfg_value(
-        cfg,
-        "retrieval_min_gap_ratio",
-        0.05,
-    )
-
-    overview_margin = _cfg_value(
-        cfg,
-        "retrieval_overview_margin",
-        0.10,
-    )
-
-    # ---------------------------------------------------------
-    # 1. No evidence / absolute low floor
-    # ---------------------------------------------------------
-
-    if metrics.top_score <= 0:
-        return (
-            "rewrite_query",
-            "low",
-            "no_retrieval_evidence",
-        )
-
-    if metrics.top_score < min_top_score:
-        return (
-            "rewrite_query",
-            "low",
-            "below_absolute_score_floor",
-        )
-
-    # ---------------------------------------------------------
-    # 2. Strong evidence
-    # ---------------------------------------------------------
+    top_score = metrics["top_score"]
+    top_to_mean = metrics["top_to_mean_ratio"]
+    gap_ratio = metrics["gap_ratio"]
 
     overview_dominant = (
         top_doc_type == "overview"
         and overview_top_score is not None
         and content_top_score is not None
-        and (
-            float(overview_top_score)
-            - float(content_top_score)
-            >= overview_margin
-        )
+        and overview_top_score >= content_top_score * (1.0 + settings.retrieval_overview_margin)
     )
 
-    relative_strength = (
-        metrics.top_to_mean_ratio >= min_top_to_mean
-        and metrics.gap_ratio >= min_gap_ratio
+    # 1. Absolute floor - checked first, regardless of relative shape.
+    if top_score < settings.retrieval_min_top_score:
+        if retry_count >= settings.max_retries:
+            return {
+                "decision": "grade",
+                "evidence_strength": "weak",
+                "reason": "weak_evidence_retries_exhausted",
+            }
+        return {
+            "decision": "rewrite_query",
+            "evidence_strength": "weak",
+            "reason": "absolute_score_below_floor",
+        }
+
+    # 2. Strong evidence requires BOTH a healthy absolute score and a
+    # confident relative shape - either signal alone isn't enough.
+    strong_by_distribution = (
+        top_score >= settings.retrieval_strong_top_score
+        and top_to_mean >= settings.retrieval_top_to_mean_ratio
+        and gap_ratio >= settings.retrieval_gap_ratio
     )
+    strong_by_overview = overview_dominant and gap_ratio >= settings.retrieval_gap_ratio
 
-    if metrics.top_score >= strong_top_score:
-        if overview_dominant:
-            return (
-                "generate",
-                "strong",
-                "overview_dominant_with_clear_margin",
-            )
+    if strong_by_distribution or strong_by_overview:
+        reason = "overview_dominant_with_clear_margin" if (strong_by_overview and not strong_by_distribution) else "strong_score_distribution"
+        return {"decision": "generate", "evidence_strength": "strong", "reason": reason}
 
-        if relative_strength:
-            return (
-                "generate",
-                "strong",
-                "strong_absolute_and_relative_evidence",
-            )
-
-    # ---------------------------------------------------------
-    # 3. Ambiguous region
-    # ---------------------------------------------------------
-
-    return (
-        "grade_documents",
-        "ambiguous",
-        "ambiguous_score_distribution",
-    )
+    # 3. Ambiguous - defer to the LLM grader.
+    if gap_ratio < settings.retrieval_gap_ratio:
+        reason = "top_candidates_too_close"
+    elif top_to_mean < settings.retrieval_top_to_mean_ratio:
+        reason = "weak_top_candidate_separation"
+    else:
+        reason = "retrieval_requires_semantic_grading"
+    return {"decision": "grade", "evidence_strength": "ambiguous", "reason": reason}

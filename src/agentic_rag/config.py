@@ -56,48 +56,22 @@ class Settings(BaseSettings):
     chunk_overlap: int = 300
     max_retries: int = 2
 
-        # =========================================================
-    # Retrieval Evidence Policy
-    # =========================================================
-
-    # These are initial configuration defaults.
-    # They MUST be calibrated against representative retrieval
-    # observations before being treated as production thresholds.
-    retrieval_min_top_score: float = 0.35
-    retrieval_strong_top_score: float = 0.55
-
-    # Relative evidence signals retained from the previous
-    # retrieval-confidence policy.
-    retrieval_min_top_to_mean_ratio: float = 1.20
-    retrieval_min_gap_ratio: float = 0.05
-
-    # An overview result may justify a strong decision when it
-    # clearly dominates the strongest content result.
-    retrieval_overview_margin: float = 0.10
-
-    # =========================================================
-    # Retrieval Grading Policy
-    # =========================================================
-
-    max_grading_candidates: int = 3
-
-    # =========================================================
-    # Generation Context Policy
-    # =========================================================
-
-    max_generation_context_documents: int = 5
-    max_generation_context_chars: int = 12000
-    max_history_messages_for_generation: int = 2
-    
     # Conversation / generation optimization
     max_history_messages_for_generation: int = 2
     max_generation_context_documents: int = 5
     max_generation_context_chars: int = 12000
     max_generation_output_chars: int = 12000
 
-    # Retrieval assessment
+    # Retrieval assessment - absolute score gate
     retrieval_min_top_score: float = 0.35
     retrieval_strong_top_score: float = 0.55
+
+    # Retrieval assessment - relative shape gate (used only once the absolute
+    # floor above is cleared). Moved here from module-level constants in
+    # nodes.py so every retrieval threshold lives in one place.
+    retrieval_top_to_mean_ratio: float = 1.10
+    retrieval_gap_ratio: float = 0.02
+    retrieval_overview_margin: float = 0.02
 
     # Development
     debug: bool = False

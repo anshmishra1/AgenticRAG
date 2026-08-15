@@ -1,205 +1,74 @@
 """Calibrates retrieval_min_top_score / retrieval_strong_top_score against
-real observed similarity scores, instead of guessing.
-
-Why this script and NOT RAGAS: RAGAS metrics (faithfulness, answer relevancy,
-context precision/recall) use an LLM judge to score GENERATION quality - they
-answer "was this answer good", not "what raw cosine-similarity number should
-the retrieval floor be". Picking a numeric threshold is a statistics problem
-on scores you already have, not a generation-quality problem. Using RAGAS for
-this would mean paying for LLM judge calls to answer a question plain
-arithmetic already answers for free. RAGAS's real job is the *separate*
-regression-test script (scripts/run_ragas_eval.py) that checks whether a
-policy change like this one accidentally hurt answer quality - a genuinely
-different question.
+real, labeled query/document pairs - not a guess, not RAGAS (which measures
+generation quality, not retrieval score separation).
 
 Usage:
-    Fill in EVAL_SET below with real (document_id, question, is_answerable)
-    triples from your own ingested documents - a mix of questions you know
-    the document CAN answer and questions you know it CANNOT (e.g. asking
-    an Explainable-AI book about LLM scaling laws, as production traffic did).
+    1. Ingest the documents you want to calibrate against, as usual.
+    2. Fill in LABELED_QUERIES below with real questions, the document_id
+       each is scoped to, and whether that pairing SHOULD match (True) or
+       is a deliberate mismatch (False) - e.g. asking an LLM-foundations
+       question while scoped to an unrelated book.
+    3. Run: python scripts/calibrate_retrieval.py
+    4. It prints the top-score distribution for "should match" vs "should
+       not match" pairs, and suggests where retrieval_min_top_score and
+       retrieval_strong_top_score should sit given the actual gap between
+       the two clusters - the same exercise we did informally from one
+       trace, done properly across multiple examples.
 
-    python scripts/calibrate_retrieval.py
+Add more rows over time as you find new failure cases - this script becomes
+more trustworthy the more real examples it has, the same way any eval set does.
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-from agentic_rag.policies.retrieval import calculate_retrieval_metrics
+from agentic_rag.graph.nodes import calculate_retrieval_metrics
 from agentic_rag.retrieval.vectorstore import retrieve_with_scores
 
-# ---------------------------------------------------------------------------
-# Fill this in with real document_ids from your registry (GET /documents)
-# and questions you already know the answer to, one way or the other.
-# The two example rows below are taken directly from the production trace
-# that surfaced this problem - keep them, they're a real regression case.
-# ---------------------------------------------------------------------------
-EVAL_SET = [
-    # (document_id, question, is_answerable)
-    (
-        "8b8f659beda18f55ab82191bde2d0d8090ae73925b2c7ea3e8d9171857cc506a",  # Foundation_of_LLMS_TongXiao.pdf
-        "What are the scaling laws in large language models?",
-        True,
-    ),
-    (
-        "92f92d40c9b94deefa0d98d0c384a0402755d69cf7485641513fc8bbeb968d21",  # Explainable-AI-for-Practitioners.pdf
-        "What are the different types of LLM?",
-        False,  # this book doesn't cover LLMs - the actual production failure case
-    ),
-    # Add more rows here as you find edge cases. Aim for at least 5-10 of
-    # each label before trusting the recommended thresholds below.
+# Fill these in with real (query, document_id, should_match) rows from your
+# own ingested documents. document_id comes from GET /documents.
+LABELED_QUERIES: list[tuple[str, str, bool]] = [
+    # True matches (Strong retrieval score distribution & grounded answer generated)
+    ("What problems does the RAG solve", "8354069b86193aa9d4c6f88b576443523f00ad68b9637711ad9f801869ffa1b2", True),
+    ("How are LLM's built", "8354069b86193aa9d4c6f88b576443523f00ad68b9637711ad9f801869ffa1b2", True),
+    ("What are the issues with traditional Fine Tuning", "8354069b86193aa9d4c6f88b576443523f00ad68b9637711ad9f801869ffa1b2", True),
+    ("Why do we still need context engineering if we already have RAG to solve these problems?", "8354069b86193aa9d4c6f88b576443523f00ad68b9637711ad9f801869ffa1b2", True),
+    
+    # False matches (Failed semantic document grading / graded as irrelevant for this document)
+    ("How to generate the dataset that will be used for fine tuning", "8354069b86193aa9d4c6f88b576443523f00ad68b9637711ad9f801869ffa1b2", False),
+    ("How to create a dataset for fine-tuningmodeloos", "8354069b86193aa9d4c6f88b576443523f00ad68b9637711ad9f801869ffa1b2", False),
 ]
 
 
-def retrieve_production_candidates(
-    document_id: str,
-    question: str,
-):
-    overview_filter = {
-        "$and": [
-            {"document_id": {"$eq": document_id}},
-            {"type": {"$eq": "overview"}},
-        ]
-    }
+def _top_score(query: str, document_id: str) -> float:
+    content_filter = {"$and": [{"document_id": {"$eq": document_id}}, {"type": {"$eq": "content"}}]}
+    results = retrieve_with_scores(query=query, k=5, filter=content_filter)
+    scores = [float(score) for _, score in results]
+    return calculate_retrieval_metrics(scores)["top_score"]
 
-    content_filter = {
-        "$and": [
-            {"document_id": {"$eq": document_id}},
-            {"type": {"$eq": "content"}},
-        ]
-    }
 
-    overview_results = retrieve_with_scores(
-        query=question,
-        k=2,
-        filter=overview_filter,
-    )
-
-    content_results = retrieve_with_scores(
-        query=question,
-        k=5,
-        filter=content_filter,
-    )
-
-    results = overview_results + content_results
-
-    results.sort(
-        key=lambda item: float(item[1]),
-        reverse=True,
-    )
-
-    return results
-
-def evaluate_candidate_threshold(
-    scores: list[tuple[float, bool]],
-    threshold: float,
-) -> dict:
-    tp = fp = tn = fn = 0
-
-    for score, is_answerable in scores:
-        predicted = score >= threshold
-
-        if predicted and is_answerable:
-            tp += 1
-        elif predicted and not is_answerable:
-            fp += 1
-        elif not predicted and not is_answerable:
-            tn += 1
-        else:
-            fn += 1
-
-    precision = (
-        tp / (tp + fp)
-        if tp + fp
-        else 0.0
-    )
-
-    recall = (
-        tp / (tp + fn)
-        if tp + fn
-        else 0.0
-    )
-
-    fpr = (
-        fp / (fp + tn)
-        if fp + tn
-        else 0.0
-    )
-
-    return {
-        "threshold": threshold,
-        "precision": precision,
-        "recall": recall,
-        "false_positive_rate": fpr,
-        "tp": tp,
-        "fp": fp,
-        "tn": tn,
-        "fn": fn,
-    }
-    
 def main() -> None:
-    if len(EVAL_SET) < 2:
-        print("EVAL_SET is empty or too small. Fill it in with real "
-              "(document_id, question, is_answerable) rows before running.")
+    if not LABELED_QUERIES:
+        print("LABELED_QUERIES is empty. Add real (query, document_id, should_match)")
+        print("rows at the top of this script before running.")
         return
 
-    answerable_scores: list[float] = []
-    unanswerable_scores: list[float] = []
+    matches, mismatches = [], []
+    for query, document_id, should_match in LABELED_QUERIES:
+        score = _top_score(query, document_id)
+        (matches if should_match else mismatches).append(score)
+        print(f"{'MATCH   ' if should_match else 'MISMATCH'} top_score={score:.4f}  {query!r}")
 
-    print("=" * 70)
-    print("RETRIEVAL CALIBRATION")
-    print("=" * 70)
+    print()
+    if matches:
+        print(f"Match scores:    min={min(matches):.4f}  max={max(matches):.4f}  mean={sum(matches)/len(matches):.4f}")
+    if mismatches:
+        print(f"Mismatch scores: min={min(mismatches):.4f}  max={max(mismatches):.4f}  mean={sum(mismatches)/len(mismatches):.4f}")
 
-    for document_id, question, is_answerable in EVAL_SET:
-        content_filter = {
-            "$and": [
-                {"document_id": {"$eq": document_id}},
-                {"type": {"$eq": "content"}},
-            ]
-        }
-
-        results = retrieve_production_candidates(
-            document_id,
-            question,
-        )
-
-        scores = [
-            float(score)
-            for _, score in results
-        ]
-
-        metrics = calculate_retrieval_metrics(scores)
-
-        label = "ANSWERABLE  " if is_answerable else "UNANSWERABLE"
-        print(f"\n[{label}] {question}")
-        print(f"  top_score={metrics.top_score:.4f}  top_to_mean={metrics.top_to_mean_ratio:.4f}  gap_ratio={metrics.gap_ratio:.4f}")
-
-        (answerable_scores if is_answerable else unanswerable_scores).append(metrics.top_score)
-
-    print("\n" + "=" * 70)
-    print("SCORE SEPARATION")
-    print("=" * 70)
-
-    if answerable_scores:
-        print(f"Answerable   top_score range: {min(answerable_scores):.4f} - {max(answerable_scores):.4f}")
-    if unanswerable_scores:
-        print(f"Unanswerable top_score range: {min(unanswerable_scores):.4f} - {max(unanswerable_scores):.4f}")
-
-    if answerable_scores and unanswerable_scores:
-        floor = max(unanswerable_scores)
-        ceiling = min(answerable_scores)
-        if floor < ceiling:
-            midpoint = (floor + ceiling) / 2
-            print(f"\nClean separation. Suggested retrieval_min_top_score: {midpoint:.3f}")
-            print(f"(sits between worst answerable {ceiling:.4f} and best unanswerable {floor:.4f})")
-        else:
-            print(f"\nNo clean separation yet (unanswerable max {floor:.4f} >= "
-                  f"answerable min {ceiling:.4f}). Add more eval rows - the "
-                  f"current EVAL_SET is too small to calibrate confidently.")
+    if matches and mismatches:
+        floor = (max(mismatches) + min(matches)) / 2
+        print(f"\nSuggested retrieval_min_top_score: ~{floor:.2f} (midpoint between the two clusters)")
+        print(f"Suggested retrieval_strong_top_score: ~{min(matches):.2f} (lowest observed genuine match)")
     else:
-        print("\nNeed at least one row of each label to suggest a threshold.")
+        print("\nNeed at least one match AND one mismatch example to suggest thresholds.")
 
 
 if __name__ == "__main__":

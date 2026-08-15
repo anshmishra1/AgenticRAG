@@ -22,13 +22,15 @@ from agentic_rag.config import settings
 from agentic_rag.graph.state import RAGState
 from agentic_rag.llm.provider import provider_chain, fast_provider_chain
 from agentic_rag.retrieval.vectorstore import retrieve_with_scores
-from agentic_rag.policies.conversation import classify_query_intent
-from agentic_rag.policies.retrieval import calculate_retrieval_metrics, classify_retrieval_confidence
-from agentic_rag.policies.generation import build_history_text, corrective_generation_instruction, truncate_context
+from agentic_rag.graph.query_utils import is_likely_follow_up
+from agentic_rag.policies.retrieval import assess_retrieval_confidence
+from agentic_rag.policies.generation import apply_generation_limits, is_refusal_answer
 from agentic_rag.core.timing import PerformanceTracker
 
 logger = logging.getLogger(__name__)
 tracker = PerformanceTracker()
+
+MAX_GRADING_CANDIDATES = 4
 
 
 # =============================================================
@@ -50,6 +52,101 @@ def _preview(text: str, length: int = 500) -> str:
 # Query Intent
 # =============================================================
 
+CONTROL_QUERY_PATTERNS = (
+    "no more questions",
+    "no further questions",
+    "nothing else",
+    "that's all",
+    "that is all",
+    "thanks",
+    "thank you",
+    "stop",
+    "done",
+    "end this",
+)
+
+
+def classify_query_intent(
+    question: str,
+    history: list,
+) -> tuple[str, bool]:
+    """
+    Lightweight deterministic query-intent classification.
+
+    Returns:
+        (intent, is_control)
+
+    Intents:
+        - new_question
+        - follow_up
+        - control
+    """
+
+    normalized = " ".join(question.lower().split())
+
+    # ---------------------------------------------------------
+    # Control / conversation-ending input
+    # ---------------------------------------------------------
+
+    if any(pattern in normalized for pattern in CONTROL_QUERY_PATTERNS):
+        return "control", True
+
+    # ---------------------------------------------------------
+    # No history -> cannot be a follow-up
+    # ---------------------------------------------------------
+
+    if not history:
+        return "new_question", False
+
+    # ---------------------------------------------------------
+    # Strong follow-up indicators
+    # ---------------------------------------------------------
+
+    follow_up_indicators = (
+        "elaborate",
+        "elaborate further",
+        "explain further",
+        "explain more",
+        "tell me more",
+        "expand on",
+        "expand upon",
+        "go deeper",
+        "in more detail",
+        "more details",
+        "why is that",
+        "how so",
+        "what about that",
+        "can you clarify",
+        "clarify that",
+        "what do you mean",
+    )
+
+    if any(indicator in normalized for indicator in follow_up_indicators):
+        return "follow_up", False
+
+    # ---------------------------------------------------------
+    # Referential follow-ups
+    # ---------------------------------------------------------
+
+    referential_terms = (
+        "that",
+        "this",
+        "it",
+        "those",
+        "these",
+        "the above",
+        "the previous",
+        "mentioned earlier",
+    )
+
+    if any(
+        normalized.startswith(term + " ")
+        or normalized == term
+        for term in referential_terms
+    ):
+        return "follow_up", False
+
+    return "new_question", False
 # =============================================================
 # Contextualize Question
 # =============================================================
@@ -158,6 +255,42 @@ def contextualize_question(state: RAGState) -> dict:
         }
 
 
+# =============================================================
+# Retrieval metrics
+# =============================================================
+
+def calculate_retrieval_metrics(scores: list[float]) -> dict:
+    if not scores:
+        return {
+            "top_score": 0.0,
+            "second_score": 0.0,
+            "score_gap": 0.0,
+            "mean_score": 0.0,
+            "top_to_mean_ratio": 0.0,
+            "gap_ratio": 0.0,
+        }
+
+    ordered = sorted((float(score) for score in scores), reverse=True)
+    top_score = ordered[0]
+    second_score = ordered[1] if len(ordered) > 1 else ordered[0]
+    mean_score = sum(ordered) / len(ordered)
+    score_gap = top_score - second_score
+
+    # Scores are assumed to be similarity scores where larger is better, as
+    # returned by PineconeVectorStore.similarity_search_with_score().
+    top_to_mean_ratio = top_score / mean_score if mean_score > 0 else 0.0
+    gap_ratio = score_gap / abs(top_score) if top_score != 0 else 0.0
+
+    return {
+        "top_score": top_score,
+        "second_score": second_score,
+        "score_gap": score_gap,
+        "mean_score": mean_score,
+        "top_to_mean_ratio": top_to_mean_ratio,
+        "gap_ratio": gap_ratio,
+    }
+
+
 def _top_score_for_type(results: list[tuple], chunk_type: str) -> float | None:
     scores = [
         float(score)
@@ -222,7 +355,7 @@ def retrieve(state: RAGState) -> dict:
         overview_docs_count = len(overview_results)
         content_docs_count = len(content_results)
         metrics = calculate_retrieval_metrics(scores)
-        top_score = metrics.top_score
+        top_score = metrics["top_score"]
         overview_top_score = _top_score_for_type(results, "overview")
         content_top_score = _top_score_for_type(results, "content")
 
@@ -241,23 +374,23 @@ def retrieve(state: RAGState) -> dict:
             "gap=%.4f | mean=%.4f | top/mean=%.4f | gap_ratio=%.4f",
             query,
             [round(score, 4) for score in scores],
-            metrics.top_score,
-            metrics.second_score,
-            metrics.score_gap,
-            metrics.mean_score,
-            metrics.top_to_mean_ratio,
-            metrics.gap_ratio,
+            metrics["top_score"],
+            metrics["second_score"],
+            metrics["score_gap"],
+            metrics["mean_score"],
+            metrics["top_to_mean_ratio"],
+            metrics["gap_ratio"],
         )
 
         return {
             "documents": docs,
             "retrieval_scores": scores,
             "retrieval_top_score": top_score,
-            "retrieval_second_score": metrics.second_score,
-            "retrieval_score_gap": metrics.score_gap,
-            "retrieval_mean_score": metrics.mean_score,
-            "retrieval_top_to_mean_ratio": metrics.top_to_mean_ratio,
-            "retrieval_gap_ratio": metrics.gap_ratio,
+            "retrieval_second_score": metrics["second_score"],
+            "retrieval_score_gap": metrics["score_gap"],
+            "retrieval_mean_score": metrics["mean_score"],
+            "retrieval_top_to_mean_ratio": metrics["top_to_mean_ratio"],
+            "retrieval_gap_ratio": metrics["gap_ratio"],
             "retrieval_overview_top_score": overview_top_score,
             "retrieval_content_top_score": content_top_score,
             "trace": [{
@@ -269,11 +402,11 @@ def retrieve(state: RAGState) -> dict:
                 "sources": [d.metadata.get("source") for d in docs],
                 "scores": scores,
                 "top_score": top_score,
-                "second_score": metrics.second_score,
-                "score_gap": metrics.score_gap,
-                "mean_score": metrics.mean_score,
-                "top_to_mean_ratio": metrics.top_to_mean_ratio,
-                "gap_ratio": metrics.gap_ratio,
+                "second_score": metrics["second_score"],
+                "score_gap": metrics["score_gap"],
+                "mean_score": metrics["mean_score"],
+                "top_to_mean_ratio": metrics["top_to_mean_ratio"],
+                "gap_ratio": metrics["gap_ratio"],
                 "overview_top_score": overview_top_score,
                 "content_top_score": content_top_score,
             }],
@@ -285,17 +418,11 @@ def retrieve(state: RAGState) -> dict:
 # =============================================================
 
 def assess_retrieval(state: RAGState) -> dict:
-    """Decide whether an LLM relevance grader is necessary - now a genuine
-    three-way decision instead of two, via policies.retrieval:
-
-      "generate"       - strong evidence (absolute AND relative), skip grading
-      "grade"           - ambiguous, defer to the LLM relevance grader
-      "rewrite_query"   - absolute score below floor, skip straight to
-                          rewriting rather than wasting a generate() call on
-                          context we're already confident is unusable
-
-    All threshold logic now lives in policies/retrieval.py, calibrated
-    against real observed scores instead of guessed.
+    """Decide whether an LLM relevance grader is necessary - or whether the
+    evidence is weak enough that grading is pointless and a query rewrite is
+    the better next step. Decision logic itself lives in
+    policies.retrieval.assess_retrieval_confidence(); this node's job is I/O
+    (printing, tracing) and reading state, not the decision rule.
     """
     with tracker.measure("assess_retrieval"):
         _separator("3. RETRIEVAL ASSESSMENT")
@@ -303,23 +430,35 @@ def assess_retrieval(state: RAGState) -> dict:
         documents = state.get("documents", [])
         scores = [float(score) for score in state.get("retrieval_scores", [])]
 
-        metrics = calculate_retrieval_metrics(scores)
-        top_doc = documents[0] if documents else None
-        top_type = top_doc.metadata.get("type") if top_doc else None
+        if not documents or not scores:
+            decision = "grade"
+            reason = "no_retrieval_candidates"
+            evidence_strength = "weak"
+        else:
+            metrics = calculate_retrieval_metrics(scores)
+            top_doc = documents[0]
+            top_type = top_doc.metadata.get("type")
+            overview_top = state.get("retrieval_overview_top_score")
+            content_top = state.get("retrieval_content_top_score")
+            retry_count = state.get("retry_count", 0)
 
-        decision, evidence_strength, reason = classify_retrieval_confidence(
-            metrics,
-            top_doc_type=top_type,
-            overview_top_score=state.get("retrieval_overview_top_score"),
-            content_top_score=state.get("retrieval_content_top_score"),
-            cfg=settings,
-        )
+            result = assess_retrieval_confidence(
+                metrics=metrics,
+                top_doc_type=top_type,
+                overview_top_score=overview_top,
+                content_top_score=content_top,
+                retry_count=retry_count,
+            )
+            decision = result["decision"]
+            evidence_strength = result["evidence_strength"]
+            reason = result["reason"]
 
-        print(f"Top score: {metrics.top_score:.4f}")
-        print(f"Second score: {metrics.second_score:.4f}")
-        print(f"Top/mean ratio: {metrics.top_to_mean_ratio:.4f}")
-        print(f"Gap ratio: {metrics.gap_ratio:.4f}")
-        print(f"Top document type: {top_type}")
+            print(f"Top score: {metrics['top_score']:.4f}")
+            print(f"Second score: {metrics['second_score']:.4f}")
+            print(f"Top/mean ratio: {metrics['top_to_mean_ratio']:.4f}")
+            print(f"Gap ratio: {metrics['gap_ratio']:.4f}")
+            print(f"Top document type: {top_type}")
+
         print(f"Evidence strength: {evidence_strength}")
         print(f"Retrieval decision: {decision}")
         print(f"Decision reason: {reason}")
@@ -333,12 +472,12 @@ def assess_retrieval(state: RAGState) -> dict:
                 "decision": decision,
                 "evidence_strength": evidence_strength,
                 "reason": reason,
-                "top_score": metrics.top_score,
-                "second_score": metrics.second_score,
-                "score_gap": metrics.score_gap,
-                "mean_score": metrics.mean_score,
-                "top_to_mean_ratio": metrics.top_to_mean_ratio,
-                "gap_ratio": metrics.gap_ratio,
+                "top_score": state.get("retrieval_top_score", 0.0),
+                "second_score": state.get("retrieval_second_score", 0.0),
+                "score_gap": state.get("retrieval_score_gap", 0.0),
+                "mean_score": state.get("retrieval_mean_score", 0.0),
+                "top_to_mean_ratio": state.get("retrieval_top_to_mean_ratio", 0.0),
+                "gap_ratio": state.get("retrieval_gap_ratio", 0.0),
             }],
         }
 
@@ -358,7 +497,7 @@ def grade_documents(state: RAGState) -> dict:
 
         # Retrieval already sorted candidates by score. Keep the grader prompt
         # bounded and focused on the strongest evidence instead of all chunks.
-        candidates = list(zip(documents, scores))[:settings.max_grading_candidates]
+        candidates = list(zip(documents, scores))[:MAX_GRADING_CANDIDATES]
         preview = [
             {
                 "rank": idx,
@@ -449,48 +588,40 @@ def generate(state: RAGState) -> dict:
     with tracker.measure("generate"):
         _separator("6. GENERATION")
 
-        documents = truncate_context(
-            state.get("documents", []),
-            settings,
-        )
+        documents = state.get("documents", [])
+        history = state.get("messages", [])
 
-        context = "\n\n".join(
-            d.page_content
-            for d in documents
-        )
+        context, history = apply_generation_limits(documents, history)
 
-        history_text, history = build_history_text(
-            state.get("messages", []),
-            settings,
-        )
-
-        hallucination_retry_count = state.get(
-            "hallucination_retry_count",
-            0,
-        )
-
-        generation_instruction = corrective_generation_instruction(
-            hallucination_retry_count,
+        history_text = (
+            "\n".join(
+                f"{m.type}: {m.content}"
+                for m in history
+            )
+            if history
+            else "None"
         )
 
         prompt = (
             "Answer the question using only the provided context and "
-            "prior conversation.\n\n"
-
+            "prior conversation. "
             "Follow the user's requested level of detail, structure, "
-            "and style.\n"
-
+            "and style. "
             "If the user asks for a detailed explanation, provide a "
-            "detailed explanation.\n"
-
-            "If the user asks for a concise answer, keep it concise.\n\n"
-
-            f"{generation_instruction}\n\n"
-
+            "detailed explanation. "
+            "If the user asks for a concise answer, keep it concise. "
+            "If the answer isn't supported by the context, say you "
+            "don't know. "
+            "Do not omit important details needed to properly answer "
+            "the question.\n\n"
             f"Prior conversation:\n{history_text}\n\n"
             f"Context:\n{context}\n\n"
             f"Question: {state['question']}"
         )
+
+        # ---------------------------------------------------------
+        # Generation diagnostics
+        # ---------------------------------------------------------
 
         context_chars = len(context)
         history_chars = len(history_text)
@@ -501,15 +632,18 @@ def generate(state: RAGState) -> dict:
         print(f"Prompt characters  : {prompt_chars}")
         print(f"Documents supplied : {len(documents)}")
         print(f"History turns      : {len(history)}")
-        print(
-            "Hallucination retry: "
-            f"{hallucination_retry_count}"
-        )
+
+        # ---------------------------------------------------------
+        # LLM generation
+        # ---------------------------------------------------------
 
         result = provider_chain.invoke(prompt)
+
         generation = result.content.strip()
 
-        print(f"Output characters  : {len(generation)}")
+        output_chars = len(generation)
+
+        print(f"Output characters  : {output_chars}")
 
         return {
             "generation": generation,
@@ -519,12 +653,12 @@ def generate(state: RAGState) -> dict:
                 "context_chars": context_chars,
                 "history_chars": history_chars,
                 "prompt_chars": prompt_chars,
-                "output_chars": len(generation),
+                "output_chars": output_chars,
                 "history_turns": len(history),
-                "hallucination_retry_count": hallucination_retry_count,
                 "answer": generation,
             }],
         }
+
 # =============================================================
 # Hallucination Check
 # =============================================================
@@ -533,53 +667,53 @@ def check_hallucination(state: RAGState) -> dict:
     with tracker.measure("check_hallucination"):
         _separator("7. HALLUCINATION CHECK")
 
+        generation = state["generation"]
+
+        if is_refusal_answer(generation):
+            print("Answer is a refusal ('I don't know' or similar) - skipping")
+            print("the hallucination check entirely. A refusal makes no")
+            print("factual claim, so there's nothing to verify as grounded.")
+            return {
+                "hallucination_grade": "grounded",
+                "hallucination_retry_count": state.get("hallucination_retry_count", 0),
+                "trace": [{
+                    "stage": "check_hallucination",
+                    "raw_grade": "skipped_refusal_short_circuit",
+                    "normalized_grade": "grounded",
+                    "hallucination_retry_count": state.get("hallucination_retry_count", 0),
+                }],
+            }
+
         documents = state.get("documents", [])
-
-        context = "\n\n".join(
-            d.page_content
-            for d in documents
-        )
-
-        generation = state.get("generation", "")
+        context = "\n\n".join(d.page_content for d in documents)
 
         prompt = (
-            "Determine whether the answer is fully supported by "
-            "the supplied context.\n\n"
-            "Return exactly one word:\n"
-            "grounded\n"
-            "or\n"
-            "hallucinated\n\n"
+            "Is the following answer fully supported by the context below? "
+            "Answer with exactly one word: 'grounded' or 'hallucinated'.\n\n"
             f"Context:\n{context}\n\n"
             f"Answer:\n{generation}"
         )
 
         result = fast_provider_chain.invoke(prompt)
-
         raw_grade = result.content.strip().lower()
-
         grade = (
             "grounded"
-            if "grounded" in raw_grade
-            and "hallucinated" not in raw_grade
+            if "grounded" in raw_grade and "hallucinated" not in raw_grade
             else "hallucinated"
         )
 
-        retry_count = state.get(
-            "hallucination_retry_count",
-            0,
-        )
-
+        hallucination_retry_count = state.get("hallucination_retry_count", 0)
         if grade == "hallucinated":
-            retry_count += 1
+            hallucination_retry_count += 1
 
         return {
             "hallucination_grade": grade,
-            "hallucination_retry_count": retry_count,
+            "hallucination_retry_count": hallucination_retry_count,
             "trace": [{
                 "stage": "check_hallucination",
                 "raw_grade": raw_grade,
                 "normalized_grade": grade,
-                "hallucination_retry_count": retry_count,
+                "hallucination_retry_count": hallucination_retry_count,
             }],
         }
 
@@ -591,57 +725,26 @@ def check_hallucination(state: RAGState) -> dict:
 def record_turn(state: RAGState) -> dict:
     _separator("8. RECORD TURN")
 
-    generation = state.get(
-        "generation",
-        "Understood.",
-    )
-
     final_entry = {
         "stage": "record_turn",
         "final_route": "end",
         "retry_count": state.get("retry_count", 0),
-        "hallucination_retry_count": state.get(
-            "hallucination_retry_count",
-            0,
-        ),
-        "retrieval_decision": state.get(
-            "retrieval_decision"
-        ),
-        "retrieval_evidence_strength": state.get(
-            "retrieval_evidence_strength"
-        ),
-        "retrieval_decision_reason": state.get(
-            "retrieval_decision_reason"
-        ),
+        "retrieval_decision": state.get("retrieval_decision"),
+        "retrieval_evidence_strength": state.get("retrieval_evidence_strength"),
+        "retrieval_decision_reason": state.get("retrieval_decision_reason"),
     }
 
-    full_trace = state.get("trace", []) + [
-        final_entry
-    ]
+    full_trace = state.get("trace", []) + [final_entry]
 
-    _separator(
-        "STRUCTURED TRACE SUMMARY (full request, end to end)"
-    )
-
-    print(
-        json.dumps(
-            full_trace,
-            indent=2,
-            default=str,
-        )
-    )
+    _separator("STRUCTURED TRACE SUMMARY (full request, end to end)")
+    print(json.dumps(full_trace, indent=2, default=str))
 
     tracker.summary()
 
     return {
-        "generation": generation,
         "messages": [
-            HumanMessage(
-                content=state["question"]
-            ),
-            AIMessage(
-                content=generation
-            ),
+            HumanMessage(content=state["question"]),
+            AIMessage(content=state["generation"]),
         ],
         "trace": [final_entry],
     }
