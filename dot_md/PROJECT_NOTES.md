@@ -1,116 +1,226 @@
-# Agentic RAG — Project Reference
+# Agentic RAG — Current Architecture Notes
 
-Living reference for the project's current state. Upload this file at the start
-of a new session instead of re-explaining the project verbally — it has enough
-context for a resumed conversation, and doubles as raw material for the
-interview Q&A doc later.
+This is the concise architecture/reference companion to `PROJECT.md`.
 
-## Architecture (request flow)
+## Current request flow
 
-```Shell
+```text
 User question
-  -> contextualize_question   (rewrites follow-ups into standalone queries,
-                                using chat history; leaves raw question untouched)
-  -> retrieve                 (fetches overview chunk(s) + top-k content chunks)
-  -> grade_documents           (LLM judges relevance: relevant | irrelevant)
-       -> if irrelevant & retries left: rewrite_query -> back to retrieve
-  -> generate                  (answers using context + chat history)
-  -> check_hallucination        (LLM judges: grounded | hallucinated)
-       -> if hallucinated & retries left: back to generate
-  -> record_turn                (appends turn to persisted chat history)
-  -> end
+    ↓
+contextualize_question
+    ↓
+retrieval_query
+    ↓
+retrieve
+    ↓
+retrieval policy
+    ├── low       → rewrite_query → retrieve
+    ├── ambiguous → grade_documents
+    │                  ├── relevant   → generate
+    │                  └── irrelevant → rewrite_query
+    └── high      → generate
+    ↓
+generation policy / refusal detection
+    ↓
+check_hallucination
+    ├── grounded       → record_turn
+    └── hallucinated   → corrective generation/retry
+    ↓
+END
 ```
 
-Ingestion is a separate path, not part of the query graph:
+The current graph is deliberately retained. The upcoming retrieval work changes the retrieval subsystem, not the overall LangGraph topology.
 
-```
-Upload -> load (pdf/image/audio) -> chunk -> generate whole-doc overview
-       -> upsert chunks + overview into Pinecone -> record in document registry
-```
+## Ingestion flow
 
-## File structure and purpose
-
-```
-src/agentic_rag/
-  config.py                Typed settings from .env (all provider keys, Pinecone,
-                            Postgres URL, chunk size, retry limit)
-  llm/
-    provider.py             ProviderChain: Groq -> Cerebras -> Bedrock fallback.
-                             Same open-weight model family across providers, so
-                             a fallback doesn't change answer quality.
-    vision.py                Image captioning via llama-4-maverick (Groq).
-                             llama-4-scout was deprecated by Groq June 2026.
-  ingestion/
-    loaders.py                load_pdf / load_image / load_audio.
-    chunking.py               RecursiveCharacterTextSplitter, 1500/300.
-    whisper_transcribe.py     Audio -> text via Groq's hosted Whisper.
-    pipeline.py                ingest_file(): orchestrates load -> chunk ->
-                                overview generation -> vector store upsert ->
-                                registry record.
-    registry.py                Postgres table tracking what's been ingested
-                                (filename, chunk count, timestamp). Answers
-                                "what did I upload" directly - NOT via the
-                                RAG graph, since that's a metadata question,
-                                not a content question.
-  retrieval/
-    vectorstore.py             get_retriever() - MMR search, k=8, excludes
-                                overview chunks (metadata filter).
-                                get_overview_retriever() - fetches only
-                                overview chunks, by metadata filter not
-                                similarity, so they're always available.
-  graph/
-    state.py                   RAGState: question (raw, untouched) vs
-                                retrieval_query (rewritten for search) vs
-                                documents/generation/grades/retry_count vs
-                                messages (persisted via checkpointer).
-    nodes.py                    All seven node functions (see flow above).
-    edges.py                    route_after_grading, route_after_hallucination_check
-                                - the two feedback loops, capped by
-                                settings.max_retries.
-    builder.py                  Assembles the StateGraph. Takes a checkpointer
-                                as a parameter (doesn't own the connection).
-  api/
-    main.py                    FastAPI app. Lifespan opens PostgresSaver via
-                                from_conn_string, builds the graph once, stores
-                                it on app.state, closes cleanly on shutdown.
-                                Endpoints: /query, /ingest, /documents, /health.
-  evaluation/
-    ragas_eval.py               Offline eval harness (faithfulness, relevancy,
-                                context precision/recall). NOT wired into the
-                                live query path on purpose.
-app/streamlit_app.py            Thin client: upload UI, document list, chat.
-                                No pipeline logic - only HTTP calls to the API.
-                                Caches requests.Session via st.cache_resource.
-tests/                          Unit tests for chunking + graph routing logic.
-                                No real API keys needed (conftest.py stubs one).
+```text
+Upload
+  ↓
+load PDF
+  ↓
+recursive chunking
+  ↓
+whole-document overview
+  ↓
+Pinecone
+  ├── embeddings
+  ├── content chunks
+  └── overview
+  ↓
+PostgreSQL document registry
 ```
 
-## Key design decisions and rationale
+PDF is the immediate optimization target. Image/audio support is intentionally deferred.
 
-| Decision                                                  | Why                                                                                                                                                                                              |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| LangChain/FAISS -> LangGraph state machine                | Enables the corrective-retrieval and hallucination-check loops; a linear chain can't branch/retry                                                                                                |
-| Chroma -> Pinecone (single vector store, no dual-backend) | Cloud deploy target has no persistent local disk; one backend, less surface area                                                                                                                 |
-| Provider fallback chain (Groq -> Cerebras -> Bedrock)     | Groq free tier RPD limits get hit during active dev; same model family across providers keeps output consistent; genuine "why 3 providers" story for interviews                                  |
-| MemorySaver -> Postgres checkpointer (Neon)               | MemorySaver is in-process, lost on restart; SQLite writes to ephemeral disk on Streamlit Cloud/Render, also lost on redeploy; Postgres survives both                                             |
-| Checkpointer opened via FastAPI lifespan, not a bare pool | Matches proper context-manager resource lifecycle: open once at startup, close once at shutdown                                                                                                  |
-| `retrieval_query` separate from `question`            | Follow-ups like "answer in bullet points" need query rewriting for retrieval, but the LLM still needs to see the literal formatting instruction to obey it                                       |
-| MMR retrieval instead of plain top-k                      | Plain top-k tends to return near-duplicate chunks from one section; MMR spreads across the document - matters for broad questions                                                                |
-| Document overview chunk, generated at ingestion           | No single 1500-char chunk can answer "what does this document cover" - that's a whole-document question needing a whole-document answer, generated once and always retrieved via metadata filter |
-| Document registry (Postgres table)                        | "What did I upload" is metadata, not content - no amount of retrieval tuning can make vector search answer it                                                                                    |
+## Policy layer
 
-## Known gaps / honest TODOs
+```text
+policies/
+├── conversation.py
+├── retrieval.py
+└── generation.py
+```
 
-- **True hybrid search (dense + sparse/BM25) not implemented.** Current retrieval is dense-only via MMR. The "Pinecone hybrid search" line predates this and hasn't been reconciled yet.
-- **Image ingestion** uses vision-model captioning (llama-4-maverick), not EasyOCR — a deliberate substitution, not the original plan.
-- **RAGAS eval** exists but isn't run automatically anywhere yet — no CI step or scheduled job calls it.
-- **Web search fallback tool** (for questions outside the uploaded docs) was discussed, not built.
-- **No re-ranking step** after retrieval — MMR is the only diversity mechanism.
-- Postgres now backs both the checkpointer (conversation memory) and the document registry — same DB, different tables, not yet consolidated into one connection/pool.
+### Conversation policy
 
-## Deployment target
+Handles deterministic conversation decisions such as control messages, likely follow-ups, and query intent. The contextualization LLM call remains in the graph node.
 
-Backend (FastAPI) + frontend (Streamlit) as separate services, both containerized
-via the provided Dockerfile / docker-compose.yml, deployed to Streamlit Cloud
-and/or Render. External dependencies: Groq, Cerebras (optional), AWS Bedrock
-(optional), Pinecone, Neon Postgres.
+### Retrieval policy
+
+Currently provides a three-way evidence decision:
+
+```text
+LOW → rewrite
+AMBIGUOUS → LLM grade
+HIGH → generate
+```
+
+This was introduced to avoid blindly trusting dense retrieval scores. It is now considered a transitional policy because the next retrieval architecture will provide a stronger relevance signal.
+
+### Generation policy
+
+Owns refusal detection and generation context/history limits. A refusal should not be sent through the hallucination checker as if it were a factual answer.
+
+## Current retrieval
+
+Current validated retrieval is dense Pinecone retrieval with document scoping and overview/content handling. MMR/diversity behavior may exist depending on the exact current `vectorstore.py`; source code remains authoritative.
+
+The previous confidence approach relied on combinations of dense similarity thresholds and relative score-shape heuristics. Runtime traces showed that these scores can have thin margins and are not a robust final relevance signal.
+
+## Retrieval problems established from runtime evidence
+
+1. Dense bi-encoder scores can be close for candidates with different actual relevance.
+2. Broad/document-level queries can underuse the overview evidence.
+3. The LLM relevance grader has produced false-negative relevance decisions.
+4. Query rewriting can produce malformed search strings and therefore needs validation.
+5. Corrective retrieval retries add repeated retrieval latency.
+6. `grounded` only establishes answer faithfulness to supplied context; it does not prove that the retrieved context was the best context for the question.
+
+## Next retrieval architecture
+
+The project is moving to a true multi-stage retrieval system:
+
+```text
+Query
+  │
+  ├──────────────→ Pinecone dense retrieval
+  │
+  └──────────────→ local BM25 sparse retrieval
+                         │
+                         ▼
+                   RRF rank fusion
+                         │
+                         ▼
+                bounded candidate set
+                         │
+                         ▼
+             Cross-encoder reranking
+                 (RTX 3060 GPU)
+                         │
+                         ▼
+                   final evidence
+                         │
+                         ▼
+                 retrieval policy
+```
+
+### Responsibilities
+
+| Component | Responsibility |
+|---|---|
+| Pinecone | Semantic candidate recall |
+| BM25 | Lexical candidate recall |
+| RRF | Rank fusion without incompatible score arithmetic |
+| Cross-encoder | Query–passage relevance precision |
+| LLM grader | Expensive tie-breaker for remaining ambiguity |
+| Query rewrite | Corrective retrieval |
+
+## BM25 storage decision
+
+BM25 will **not** be implemented as a PostgreSQL search service.
+
+PostgreSQL remains responsible for:
+
+- LangGraph checkpoints;
+- document registry/application metadata.
+
+The sparse retrieval corpus/index will be local and persistent, with document scoping. This avoids introducing another database responsibility for the current project scale.
+
+## GPU decision
+
+Development hardware:
+
+```text
+NVIDIA GeForce RTX 3060
+12 GB VRAM
+```
+
+The local GPU will be used primarily for cross-encoder reranking. LLM inference and Pinecone remain API/cloud based, preserving scalability and avoiding dependence on the development machine for generation.
+
+The reranker should support CPU fallback for deployment environments without a GPU.
+
+## Planned retrieval modules
+
+```text
+src/agentic_rag/retrieval/
+├── vectorstore.py
+├── bm25.py
+├── fusion.py
+├── reranker.py
+└── hybrid.py
+```
+
+These modules should be implemented incrementally and tested independently before graph integration.
+
+## Planned evaluation
+
+Compare:
+
+```text
+A. Dense only
+B. Dense + BM25
+C. Dense + BM25 + RRF
+D. Dense + BM25 + RRF + Cross-encoder
+```
+
+Measure:
+
+- retrieval recall/precision;
+- ranking quality;
+- retrieval latency;
+- reranking latency;
+- total request latency;
+- LLM calls/retries;
+- RAGAS faithfulness/relevancy/context precision/context recall.
+
+RAGAS is an evaluation layer, not the retrieval mechanism.
+
+## Immediate implementation order
+
+```text
+1. Local persistent BM25 corpus/index
+2. Independent BM25 tests
+3. RRF implementation
+4. Dense vs BM25 vs RRF evaluation
+5. Cross-encoder implementation
+6. GPU/CPU reranker test
+7. Hybrid retrieval integration
+8. State + trace updates
+9. Replace old dense-score confidence policy
+10. Re-evaluate grader and rewrite behavior
+11. Retrieval + RAGAS evaluation
+12. Remaining performance optimization
+```
+
+## Architectural rules
+
+- Do not redesign the LangGraph topology without evidence.
+- Do not keep tuning dense-only thresholds as the primary retrieval solution.
+- Do not directly add dense and BM25 scores; use rank fusion.
+- Do not use PostgreSQL as the BM25 index unless future scale requires it.
+- Do not rerank the entire corpus; rerank a bounded candidate set.
+- Load the cross-encoder once and reuse it.
+- Keep expensive LLM grading for genuinely ambiguous cases.
+- Validate rewritten queries before sending them back to retrieval.
+- Treat `grounded` and `answered` as separate concepts.
+- Implement and test one retrieval layer at a time.
