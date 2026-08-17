@@ -1,1463 +1,722 @@
 # Agentic RAG — Project Reference & Handoff
 
-## Purpose
+## 1. Purpose
 
-This file is the **single-source project handoff document** for the Agentic RAG project.
+This document is the current project handoff for the Agentic RAG application.
 
-It is written so that a new chatbot/LLM — including a local Ollama model — can understand the project's history, current architecture, important design decisions, known issues, completed work, and next steps **without requiring the user to re-explain the project**.
+It describes **what is implemented now**, why the current architecture exists, the problems discovered during optimization, and the next retrieval-optimization direction.
 
-### How to use this file
-
-At the beginning of a new development session:
-
-1. Load this file first.
-2. Treat the **Current State** section as authoritative for the latest project direction.
-3. Treat **Completed Changes** as historical context; do not repeat those investigations unless a regression occurs.
-4. Treat **Known Gaps / TODOs** as work that has not yet been completed.
-5. Before changing architecture, inspect the relevant current source files because this document is a handoff summary, not a replacement for source code.
+> **Rule:** current source code is authoritative. Historical notes are context only.
 
 ---
 
-# 1. Project Goal
+# 2. Current Project Position
 
-Build a production-oriented **Agentic RAG application** that can:
+The project is currently an **advanced/corrective RAG foundation**, not yet a full tool-using agent.
 
-- ingest PDFs, images, and audio;
-- transform them into searchable knowledge;
-- retrieve relevant document context;
-- answer questions grounded in the ingested knowledge;
-- maintain conversational state;
-- correct poor retrieval through query rewriting;
-- verify generated answers for hallucination;
-- expose the RAG pipeline through a FastAPI backend;
-- provide a conversational Streamlit frontend;
-- persist graph/checkpoint state through PostgreSQL;
-- eventually evolve into a true **Agentic RAG system with tool access, tool selection, multi-step reasoning, and external capabilities**.
-
-The project is deliberately being developed in stages:
+The current stack is:
 
 ```text
-Basic RAG
-    ↓
-Production-style RAG
-    ↓
-Corrective / Advanced RAG       ← current RAG capability
-    ↓
-Agentic RAG                     ← next major phase
-    ↓
-Advanced Agentic System
-```
-
----
-
-# 2. Current Maturity
-
-## RAG maturity
-
-**Current assessment: ~7/10 — Intermediate/Advanced, corrective RAG.**
-
-The system is no longer a basic:
-
-```text
-Query → Embed → Vector DB → Context → LLM
-```
-
-pipeline.
-
-It currently contains:
-
-- document ingestion;
-- chunking;
-- embeddings;
-- Pinecone vector retrieval;
-- conversational state;
-- query contextualization;
-- relevance grading;
-- corrective query rewriting;
-- re-retrieval;
-- grounded generation;
-- hallucination checking;
-- regeneration;
-- LangGraph orchestration;
-- FastAPI backend;
-- Streamlit UI;
-- PostgreSQL checkpointing.
-
-## Agentic maturity
-
-**Current assessment: foundation only; true tool-using agency has not yet been implemented.**
-
-The next major milestone is to make the existing RAG capability itself a tool and then add additional tools such as:
-
-- web search;
-- calculator;
-- potentially SQL/database access;
-- document metadata access;
-- later MCP-based tools.
-
-The goal is not to add tools for the sake of complexity. The agent must be able to decide **when a tool is necessary, which tool to use, execute it, inspect the result, and continue or answer**.
-
----
-
-# 3. Architecture — Current Query Flow
-
-The intended current corrective-RAG request flow is:
-
-```text
-User question
-    ↓
-contextualize_question
-    ↓
-retrieve
-    ↓
-grade_documents
-    │
-    ├── relevant
-    │      ↓
-    │   generate
-    │      ↓
-    │   check_hallucination
-    │      │
-    │      ├── grounded → record_turn → END
-    │      │
-    │      └── hallucinated → generate
-    │
-    └── irrelevant
-           ↓
-       rewrite_query
-           ↓
-        retrieve
-```
-
-### Important state separation
-
-The graph intentionally distinguishes:
-
-```text
-question
-```
-
-from:
-
-```text
-retrieval_query
-```
-
-`question` is the user's original wording and must remain untouched so that formatting/style instructions survive.
-
-`retrieval_query` is the standalone/search-optimized version used by retrieval.
-
-Example:
-
-```text
-User:
-"Explain this in detail and use bullet points."
-
-question:
-"Explain this in detail and use bullet points."
-
-retrieval_query:
-"topic being discussed"
-```
-
-This prevents retrieval-oriented rewriting from destroying the user's answer-formatting instructions.
-
----
-
-# 4. Ingestion Flow
-
-Ingestion is separate from the query graph.
-
-```text
-Upload
-  ↓
-load
-  ├── PDF
-  ├── image
-  └── audio
-  ↓
-chunk
-  ↓
-generate whole-document overview
-  ↓
-upsert chunks + overview into Pinecone
-  ↓
-record ingestion metadata in PostgreSQL
-```
-
-The whole-document overview exists because a single chunk cannot reliably answer questions such as:
-
-> "What does this document cover?"
-
-The overview is generated once during ingestion rather than reconstructed from arbitrary fragments during every query.
-
----
-
-# 5. Current Project Structure
-
-Expected high-level structure:
-
-```text
-agentic-rag/
-│
-├── src/
-│   └── agentic_rag/
-│       ├── config.py
-│       │
-│       ├── llm/
-│       │   ├── provider.py
-│       │   └── vision.py
-│       │
-│       ├── ingestion/
-│       │   ├── loaders.py
-│       │   ├── chunking.py
-│       │   ├── whisper_transcribe.py
-│       │   ├── pipeline.py
-│       │   └── registry.py
-│       │
-│       ├── retrieval/
-│       │   └── vectorstore.py
-│       │
-│       ├── graph/
-│       │   ├── state.py
-│       │   ├── nodes.py
-│       │   ├── edges.py
-│       │   └── builder.py
-│       │
-│       └── api/
-│           └── main.py
-│
-├── app/
-│   └── streamlit_app.py
-│
-├── evaluation/
-│   └── ragas_eval.py
-│
-└── tests/
-```
-
----
-
-# 6. File Responsibilities
-
-## `src/agentic_rag/config.py`
-
-Central settings loaded through Pydantic Settings and `.env`.
-
-Current settings include:
-
-- Groq API key;
-- Cerebras API key;
-- AWS Bedrock region;
-- Pinecone API key;
-- Pinecone index name;
-- HuggingFace token;
-- PostgreSQL URL;
-- embedding model;
-- chunk size;
-- chunk overlap;
-- maximum retries.
-
-Current local PostgreSQL configuration discovered during development:
-
-```text
-PostgreSQL: localhost:5432
-```
-
-The previous configuration used port `5442`, but local PostgreSQL was found listening on `5432`. Docker was not running.
-
----
-
-## `src/agentic_rag/llm/provider.py`
-
-Provider abstraction / fallback chain.
-
-The intended provider strategy is:
-
-```text
-Groq
-  ↓ fallback
-Cerebras
-  ↓ fallback
-AWS Bedrock
-```
-
-The goal is to maintain a stable model family/behavior while avoiding dependence on a single provider.
-
-### Important generation behavior
-
-The generation prompt previously contained:
-
-```text
-Keep the answer concise.
-```
-
-This caused answers to remain around 2–4 sentences even when the user explicitly requested elaboration.
-
-This instruction should be removed/replaced with:
-
-```text
-Follow the user's requested level of detail, structure, and style.
-If the user asks for a detailed explanation, provide a detailed explanation.
-If the user asks for a concise answer, keep it concise.
-Do not omit important details needed to properly answer the question.
-```
-
-This is a known generation-quality modification.
-
----
-
-## `src/agentic_rag/llm/vision.py`
-
-Image understanding/captioning component.
-
-The project notes indicate image ingestion uses a vision model rather than the originally considered OCR path.
-
----
-
-## `src/agentic_rag/ingestion/loaders.py`
-
-Loads supported input types:
-
-```text
-.pdf
-.png
-.jpg
-.jpeg
-.mp3
-.wav
-.m4a
-```
-
----
-
-## `src/agentic_rag/ingestion/chunking.py`
-
-Uses recursive text splitting.
-
-Target configuration:
-
-```text
-chunk_size = 1500
-chunk_overlap = 300
-```
-
----
-
-## `src/agentic_rag/ingestion/whisper_transcribe.py`
-
-Audio → text transcription.
-
-Uses hosted Whisper functionality.
-
----
-
-## `src/agentic_rag/ingestion/pipeline.py`
-
-Orchestrates:
-
-```text
-load → chunk → overview → Pinecone upsert → registry record
-```
-
-The function is:
-
-```python
-ingest_file(path, display_name=None)
-```
-
-Important API-side improvement:
-
-```python
-ingest_file(
-    tmp_path,
-    display_name=upload.filename,
-)
-```
-
-should be used so the original uploaded filename is retained as metadata rather than the temporary Windows filename.
-
----
-
-## `src/agentic_rag/ingestion/registry.py`
-
-Tracks ingested documents in PostgreSQL.
-
-Purpose:
-
-```text
-"What did I upload?"
-```
-
-is a metadata question, not a semantic document-content question.
-
-Therefore it should not be forced through the normal RAG retrieval graph.
-
----
-
-# 7. Retrieval
-
-## `src/agentic_rag/retrieval/vectorstore.py`
-
-Uses:
-
-```text
-HuggingFaceEmbeddings
-        ↓
-PineconeVectorStore
-        ↓
-retriever
-```
-
-Current embedding model configured through:
-
-```text
-settings.embedding_model
-```
-
-Default:
-
-```text
-all-MiniLM-L6-v2
-```
-
-The uploaded source notes describe an MMR-based retriever with k=8 and an overview-specific retriever. The current source code should be treated as authoritative if these values differ.
-
-### Important historical discrepancy
-
-An earlier version of the project used plain:
-
-```text
-k = 5
-```
-
-retrieval.
-
-Later project notes describe:
-
-```text
-MMR
-k = 8
-overview filtering
-```
-
-Do not assume both are simultaneously true. Check the current `vectorstore.py` before modifying retrieval.
-
----
-
-# 8. Graph State
-
-## `src/agentic_rag/graph/state.py`
-
-The shared `RAGState` contains:
-
-```text
-question
-retrieval_query
-documents
-generation
-relevance_grade
-hallucination_grade
-retry_count
-messages
-```
-
-### Meaning
-
-```text
-question
-    = raw user input
-
-retrieval_query
-    = rewritten/contextualized search query
-
-documents
-    = retrieved LangChain Documents
-
-generation
-    = final LLM answer
-
-relevance_grade
-    = relevant | irrelevant
-
-hallucination_grade
-    = grounded | hallucinated
-
-retry_count
-    = corrective loop counter
-
-messages
-    = persisted conversation history
-```
-
----
-
-# 9. Graph Nodes
-
-## `src/agentic_rag/graph/nodes.py`
-
-The important nodes are:
-
-### `contextualize_question`
-
-Uses conversation history to turn follow-up questions into standalone retrieval queries.
-
-Example:
-
-```text
-Previous:
-"What is Linux?"
-
-Follow-up:
-"Explain its architecture."
-
-Retrieval query:
-"Explain the architecture of Linux."
-```
-
-For a first question with no history, the original question is used directly.
-
----
-
-### `retrieve`
-
-Calls the vector retriever using:
-
-```text
-retrieval_query
-```
-
-or falls back to:
-
-```text
-question
-```
-
-if no retrieval query exists.
-
----
-
-### `grade_documents`
-
-Uses the LLM to classify retrieved context:
-
-```text
-relevant
-```
-
-or:
-
-```text
-irrelevant
-```
-
-This is a batch-level relevance grade, not an individual per-document relevance score.
-
----
-
-### `rewrite_query`
-
-Runs when retrieval is considered irrelevant and retry budget remains.
-
-It rewrites the search query for better semantic retrieval.
-
----
-
-### `generate`
-
-Generates an answer using:
-
-- retrieved context;
-- prior conversation;
-- original user question.
-
-It must respect the user's requested answer length and style.
-
-It should **not** globally force concise answers.
-
-If the answer cannot be supported by context, the intended behavior is:
-
-```text
-I don't know.
-```
-
----
-
-### `check_hallucination`
-
-Checks whether the generated answer is supported by retrieved context:
-
-```text
-grounded
-```
-
-or:
-
-```text
-hallucinated
-```
-
-Important interpretation:
-
-```text
-"I don't know" + grounded
-```
-
-does NOT mean the question was successfully answered.
-
-It only means the answer itself did not introduce unsupported factual claims.
-
----
-
-### `record_turn`
-
-Adds the user's question and assistant answer to persisted conversation history.
-
----
-
-# 10. Graph Routing
-
-## `src/agentic_rag/graph/edges.py`
-
-### After relevance grading
-
-```text
-relevant
-    → generate
-
-irrelevant + retries available
-    → rewrite_query
-
-irrelevant + retry limit reached
-    → generate best-effort answer
-```
-
-### After hallucination check
-
-```text
-grounded
-    → record_turn
-
-hallucinated + retries available
-    → generate again
-
-hallucinated + retry limit reached
-    → record_turn / END
-```
-
-### Known architectural limitation
-
-The hallucination loop currently regenerates against essentially the same context.
-
-A stronger future design should change something after a hallucination, for example:
-
-```text
-hallucinated
-    ↓
-retrieve additional evidence
-or
-answer correction / critique
-    ↓
-generate
-```
-
-Simply asking the same generation step to try again is not a strong corrective mechanism.
-
----
-
-# 11. Graph Builder
-
-## `src/agentic_rag/graph/builder.py`
-
-Builds the LangGraph `StateGraph`.
-
-It receives the checkpointer from the API layer rather than owning the PostgreSQL connection.
-
-The intended query graph is:
-
-```text
-contextualize_question
-    ↓
-retrieve
-    ↓
-grade_documents
-    ├── generate
-    └── rewrite_query → retrieve
-    ↓
-check_hallucination
-    ├── record_turn
-    └── generate
-    ↓
-END
-```
-
-### Important historical issue
-
-`contextualize_question()` existed in `nodes.py` before it was actually connected to the graph.
-
-This was identified and corrected conceptually by adding:
-
-```text
-contextualize_question
-```
-
-as the graph entry node.
-
-This is important for follow-up questions.
-
----
-
-# 12. FastAPI Backend
-
-## `src/agentic_rag/api/main.py`
-
-FastAPI is the stable REST boundary between the UI and LangGraph.
-
-The UI does not directly manipulate LangGraph internals.
-
-### Endpoints
-
-```text
-POST /query
-POST /ingest
-GET  /health
-```
-
-Some project notes also mention:
-
-```text
-GET /documents
-```
-
-If that endpoint is not present in the current source, do not assume it exists.
-
-### `/query`
-
-Receives:
-
-```json
-{
-  "question": "...",
-  "session_id": "..."
-}
-```
-
-and invokes LangGraph using:
-
-```text
-thread_id = session_id
-```
-
-This connects the conversation to PostgreSQL checkpoint state.
-
-### `/ingest`
-
-Accepts multiple files, writes temporary files, runs `ingest_file()`, and deletes temporary files afterwards.
-
-Important current improvement:
-
-```python
-ingest_file(tmp_path, display_name=upload.filename)
-```
-
-to preserve the original document name.
-
-### `/health`
-
-Returns:
-
-```json
-{
-  "status": "ok"
-}
-```
-
----
-
-# 13. PostgreSQL / LangGraph Checkpointing
-
-PostgreSQL is used for persistent graph/checkpoint state.
-
-The FastAPI lifespan owns the checkpointer lifecycle:
-
-```text
-Application startup
-    ↓
-PostgresSaver.from_conn_string(...)
-    ↓
-checkpointer.setup()
-    ↓
-build graph
-    ↓
-serve requests
-    ↓
-Application shutdown
-    ↓
-connection closes
-```
-
-This is preferred over creating/closing a database connection for every request.
-
-### Local development finding
-
-Local PostgreSQL was confirmed to be listening on:
-
-```text
-localhost:5432
-```
-
-not:
-
-```text
-localhost:5442
-```
-
-Docker was not running during diagnosis.
-
----
-
-# 14. Streamlit Frontend
-
-## `app/streamlit_app.py`
-
-The Streamlit application is intentionally thin.
-
-It should contain UI and HTTP logic only.
-
-### Current UI behavior
-
-The UI now supports:
-
-- document upload;
-- ingestion;
-- persistent visible chat history;
-- multiple questions in the same session;
-- follow-up questions;
-- entirely new questions;
-- assistant responses;
-- grounding status;
-- reusable HTTP session.
-
-The chat UI uses Streamlit's conversational primitives rather than a single ephemeral text input.
-
-Conceptually:
-
-```text
-User message
-    ↓
-display in chat
-    ↓
-POST /query
+Streamlit
     ↓
 FastAPI
     ↓
 LangGraph
     ↓
-response
+Conversation Policy
     ↓
-display assistant message
+Dense Retrieval / Pinecone
     ↓
-store in Streamlit chat history
+Retrieval Policy
+    ↓
+Relevance Grading / Query Rewrite
+    ↓
+Generation
+    ↓
+Hallucination Check
+    ↓
+PostgreSQL Checkpointing
 ```
 
-The same `session_id` is sent for each query, so the backend can maintain the conversation state.
-
-### Important follow-up behavior
-
-The UI supports both:
-
-```text
-follow-up:
-"Explain that in more detail."
-```
-
-and:
-
-```text
-new question:
-"What is Docker?"
-```
-
-However, the graph's contextualization logic must distinguish between genuine follow-ups and independent new questions. This is an area for future improvement.
+The immediate engineering goal is **retrieval-quality optimization**, before moving to the later agent/tool phase.
 
 ---
 
-# 15. Debugging / Observability
+# 3. Current End-to-End Architecture
 
-A major development decision was made to stop debugging the RAG pipeline as a black box.
+## 3.1 Ingestion path
 
-The desired debug trace is:
-
-```text
-QUESTION
-    ↓
-RETRIEVAL QUERY
-    ↓
-RETRIEVED DOCUMENTS
-    ↓
-RELEVANCE GRADE
-    ↓
-QUERY REWRITE (if needed)
-    ↓
-GENERATION
-    ↓
-HALLUCINATION GRADE
-    ↓
-FINAL ROUTE
-```
-
-For each request, development-mode logging should expose:
-
-- original question;
-- contextualized retrieval query;
-- number of retrieved documents;
-- document metadata;
-- document previews;
-- relevance grader raw output;
-- normalized relevance grade;
-- retry count;
-- rewritten query;
-- generation context preview;
-- generated answer;
-- hallucination grader raw output;
-- final route.
-
-### Purpose
-
-This allows us to distinguish:
+Ingestion is separate from the query graph.
 
 ```text
-Retrieval failure
-vs
-Relevance grader failure
-vs
-Generation failure
-vs
-Hallucination grader failure
+User uploads PDF
+       ↓
+FastAPI /ingest
+       ↓
+Temporary file
+       ↓
+loaders.py
+       ↓
+PDF text extraction
+       ↓
+chunking.py
+       ↓
+content chunks
+       ↓
+whole-document overview
+       ↓
+┌───────────────────────────────┐
+│ Pinecone                      │
+│ embeddings + chunks + overview│
+└───────────────────────────────┘
+       ↓
+registry.py
+       ↓
+PostgreSQL document metadata
 ```
 
-Do not randomly modify multiple layers before inspecting this trace.
+For the current optimization phase, **PDF is the primary supported/validated modality**. Image/audio support exists in the codebase but is intentionally not the current optimization target.
+
+The document registry answers metadata questions such as "what did I upload?" and should not be confused with semantic document retrieval.
 
 ---
 
-# 16. Important Debugging Lesson: "I Don't Know"
-
-A test such as:
+# 4. Current Query Architecture
 
 ```text
-What is Linux?
+                         USER QUESTION
+                              │
+                              ▼
+                    contextualize_question
+                              │
+                 ┌────────────┴────────────┐
+                 │                         │
+          first/new question         follow-up
+                 │                         │
+                 └────────────┬────────────┘
+                              ▼
+                      retrieval_query
+                              │
+                              ▼
+                         retrieve
+                              │
+                              ▼
+                    assess_retrieval
+                              │
+                ┌─────────────┼─────────────┐
+                │             │             │
+               LOW       AMBIGUOUS        HIGH
+                │             │             │
+                ▼             ▼             ▼
+             rewrite       grade         generate
+                │             │             │
+                │       ┌─────┴─────┐       │
+                │       │           │       │
+                │    relevant   irrelevant  │
+                │       │           │       │
+                │       ▼           ▼       │
+                │    generate    rewrite    │
+                │       │           │       │
+                └───────┴───────────┘       │
+                                            ▼
+                                       generation
+                                            │
+                                            ▼
+                                    refusal detection
+                                            │
+                                  ┌─────────┴─────────┐
+                                  │                   │
+                               refusal           factual answer
+                                  │                   │
+                                  ▼                   ▼
+                               record        hallucination check
+                                                      │
+                                            ┌─────────┴─────────┐
+                                            │                   │
+                                         grounded          hallucinated
+                                            │                   │
+                                            ▼                   ▼
+                                         record              retry
 ```
 
-may correctly produce:
+### Important state separation
+
+```text
+question
+```
+
+is the original user request and must remain intact.
+
+```text
+retrieval_query
+```
+
+is the search-oriented query produced by contextualization/rewrite.
+
+This prevents retrieval optimization from destroying user instructions such as:
+
+```text
+"Explain this in detail and give examples."
+```
+
+---
+
+# 5. Current Policy Architecture
+
+The policy layer was introduced to prevent routing logic from being scattered across `nodes.py`.
+
+```text
+policies/
+├── conversation.py
+├── retrieval.py
+└── generation.py
+```
+
+## `conversation.py`
+
+Responsible for deterministic conversation-level decisions such as:
+
+- control/termination messages;
+- likely follow-up detection;
+- query-intent classification.
+
+The actual contextualization LLM call remains in the graph node.
+
+## `retrieval.py`
+
+Currently contains the three-way retrieval evidence gate:
+
+```text
+LOW
+AMBIGUOUS
+HIGH
+```
+
+The earlier approach relied heavily on Pinecone/bi-encoder score thresholds and relative score shape.
+
+That approach is now considered a temporary foundation rather than the final retrieval architecture.
+
+## `generation.py`
+
+Owns generation-related policies such as:
+
+- refusal detection;
+- context limits;
+- history limits.
+
+A refusal should not be sent through the hallucination checker as though it were a factual answer.
+
+---
+
+# 6. What We Learned From Runtime Traces
+
+The timing/trace instrumentation exposed several important behaviors.
+
+### 6.1 Dense retrieval is the major latency contributor
+
+Repeated Pinecone retrieval calls were commonly around 2–3+ seconds during development, and corrective retries multiplied this cost.
+
+Therefore the optimization target is not simply "make the LLM faster".
+
+### 6.2 Bi-encoder similarity has thin margins
+
+Dense retrieval embeds query and documents independently. Similarity scores can be close even when one candidate is meaningfully better than another.
+
+This produced cases where:
+
+```text
+high absolute similarity
++
+small candidate separation
+```
+
+was difficult to classify reliably.
+
+### 6.3 Relative thresholds became a tuning exercise
+
+The previous policy used combinations of:
+
+```text
+absolute top-score floor
++
+top/mean ratio
++
+score-gap ratio
++
+overview margin
+```
+
+This helped expose retrieval behavior but did not provide a robust long-term relevance signal.
+
+The project therefore moves away from continuously tuning those values.
+
+### 6.4 Relevance grading produced false negatives
+
+Some retrieved passages were semantically relevant but were classified as `irrelevant` by the LLM grader.
+
+This caused unnecessary:
+
+```text
+rewrite → retrieve → grade → retrieve ...
+```
+
+loops.
+
+### 6.5 Query rewriting can produce malformed search queries
+
+Runtime traces showed malformed rewrites such as concatenated technical terms.
+
+Therefore query rewriting needs validation, not blind reinsertion into retrieval.
+
+### 6.6 Grounded does not mean answered
+
+An answer such as:
 
 ```text
 I don't know.
 ```
 
-if Linux is not present in the uploaded documents.
+can be correctly classified as grounded because it introduces no unsupported factual claim.
 
-This is expected behavior for a document-grounded RAG system.
-
-Also:
+Therefore:
 
 ```text
-I don't know.
-Grounded in context
+grounded ≠ successful answer
 ```
 
-is not contradictory.
-
-It means:
-
-```text
-The answer did not hallucinate.
-```
-
-It does NOT mean:
-
-```text
-The question was successfully answered.
-```
-
-A better UI should eventually distinguish:
-
-```text
-Answer supported by context
-```
-
-from:
-
-```text
-No answer found in context
-```
+The system must distinguish answer faithfulness from answerability/retrieval success.
 
 ---
 
-# 17. Generation Length Problem
+# 7. Why We Are Changing Retrieval Architecture
 
-A specific generation-quality issue was identified.
-
-The generation prompt contained:
+The previous dense-only architecture was:
 
 ```text
-Keep the answer concise.
-```
-
-This was causing answers to remain short even when the user explicitly asked for detail.
-
-### Desired behavior
-
-```text
-User asks for definition
-    → concise
-
-User asks for detailed explanation
-    → detailed
-
-User asks for examples
-    → include examples
-
-User asks for advantages + limitations
-    → structured detailed answer
-
-User asks for one line
-    → one line
-```
-
-The user's instruction should determine answer length rather than a hard-coded global brevity rule.
-
----
-
-# 18. Why This Is Already More Than Basic RAG
-
-Current capabilities include:
-
-```text
-Document ingestion
-        ↓
-Chunking
-        ↓
-Embeddings
-        ↓
+Query
+  ↓
+Embedding
+  ↓
 Pinecone
-        ↓
-Contextual retrieval
-        ↓
-Relevance grading
-        ↓
-Corrective query rewriting
-        ↓
-Re-retrieval
-        ↓
-Grounded generation
-        ↓
-Hallucination verification
-        ↓
-Regeneration
-        ↓
-Persistent conversation state
+  ↓
+Cosine similarity
+  ↓
+Threshold policy
 ```
 
-This is best described as:
-
-> **Corrective / Advanced RAG**
-
-It is not yet a full tool-using agent.
-
----
-
-# 19. Agentic Phase — NEXT MAJOR DEVELOPMENT
-
-The next phase is to transform the current RAG subsystem into a tool available to an agent.
-
-The target architecture is:
+The next architecture is deliberately multi-stage:
 
 ```text
-                         ┌── RAG / Document Search
-                         │
-User → Agent/Router ─────┼── Web Search
-                         │
-                         ├── Calculator
-                         │
-                         ├── Document Metadata
-                         │
-                         └── Future Tools
+Query
+  ↓
+Dense retrieval ───────────┐
+                           │
+Sparse BM25 retrieval ─────┤
+                           ▼
+                     RRF fusion
+                           │
+                           ▼
+                 Cross-encoder reranker
+                           │
+                           ▼
+                    final evidence
+                           │
+                    retrieval policy
 ```
 
-The agent should be able to:
+Each component has a distinct responsibility.
 
-1. understand the user request;
-2. decide whether a tool is required;
-3. select the appropriate tool;
-4. execute it;
-5. inspect the result;
-6. decide whether another tool call is required;
-7. produce the final answer.
+| Component | Responsibility |
+|---|---|
+| Pinecone dense retrieval | Semantic recall |
+| BM25 | Lexical/keyword recall |
+| RRF | Combine independent ranking signals without mixing incompatible score scales |
+| Cross-encoder | Precise query–passage relevance modelling |
+| LLM grader | Expensive semantic tie-breaker for genuinely ambiguous evidence |
+| Query rewrite | Correct failed retrieval attempts |
 
 ---
 
-# 20. Agentic RAG Roadmap
+# 8. Planned Hybrid Retrieval Architecture
 
-## Agentic RAG v1
+## 8.1 Dense retrieval
 
-Implement:
+Pinecone remains the cloud vector store.
 
-1. Existing RAG as `search_documents` tool.
-2. Calculator tool.
-3. Web search tool.
-4. LLM tool selection.
-5. Tool execution loop.
-6. Conditional routing.
-7. Persistent conversation state.
+It continues to provide semantic candidate retrieval and document scoping through `document_id`.
 
-Target flow:
+## 8.2 BM25
+
+BM25 will be a **local sparse retrieval index**, not a PostgreSQL search service.
+
+The corpus will be derived from the ingested PDF chunks.
+
+Conceptually:
 
 ```text
-User
- ↓
-Agent
- ↓
-Decide tool
- ├── RAG
- ├── Web
- └── Calculator
- ↓
-Tool result
- ↓
-Observe
- ↓
-Need another tool?
- ├── YES → tool
- └── NO → answer
+PDF chunks
+   ↓
+local persistent corpus/index
+   ↓
+BM25
 ```
 
----
+PostgreSQL remains responsible for application/checkpoint/document-registry concerns rather than being forced into the BM25 retrieval path.
 
-## Agentic RAG v2
+## 8.3 Reciprocal Rank Fusion
 
-Then add:
+Dense and BM25 scores exist on different scales and therefore should not simply be added.
 
-- multi-step tool use;
-- tool-result evaluation;
-- planning;
-- better failure handling;
-- source-aware answers;
-- agent tracing;
-- tool-call success/failure metrics;
-- stronger memory separation;
-- RAG + agent evaluation.
+RRF will combine their **rank positions** instead.
 
----
-
-## MCP phase
-
-MCP should be introduced **after basic tool calling is understood and working**.
-
-Desired progression:
+Conceptually:
 
 ```text
-LLM
- ↓
-Native application tool
- ↓
-Tool result
- ↓
-LLM
+Dense ranking ─────┐
+                   ├── RRF ──> fused candidates
+BM25 ranking ──────┘
 ```
 
-then:
+This avoids another arbitrary weighted-score calibration exercise.
+
+## 8.4 Cross-encoder reranking
+
+The fused candidate set will be reranked with a local cross-encoder such as:
 
 ```text
-LLM / Agent
- ↓
-MCP client
- ↓
-MCP server
- ├── Search
- ├── SQL
- ├── Files
- └── Other external capabilities
+cross-encoder/ms-marco-MiniLM-L-6-v2
 ```
 
-Do not introduce MCP merely for complexity. First establish the underlying tool-calling loop.
+Unlike the dense bi-encoder, a cross-encoder receives:
+
+```text
+(query, candidate passage)
+```
+
+as a pair and directly models their interaction.
+
+The cross-encoder will run locally and can use the user's RTX 3060 GPU.
+
+The GPU is therefore used for a computationally intensive but bounded local task, while LLM generation and cloud vector infrastructure remain provider/API based.
 
 ---
 
-# 21. Evaluation
+# 9. Target Retrieval Flow
 
-## `evaluation/ragas_eval.py`
+```text
+                         QUERY
+                           │
+                           ▼
+                   contextualization
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │ Candidate generation  │
+              └───────────┬────────────┘
+                          │
+               ┌──────────┴──────────┐
+               ▼                     ▼
+       Pinecone / Dense           BM25 / Sparse
+          top-N candidates          top-N candidates
+               │                     │
+               └──────────┬──────────┘
+                          ▼
+                     RRF fusion
+                          │
+                    fused top-N
+                          │
+                          ▼
+                 Cross-encoder GPU
+                          │
+                          ▼
+                  reranked top-K
+                          │
+                          ▼
+                 retrieval assessment
+                          │
+              ┌───────────┼───────────┐
+              ▼           ▼           ▼
+           rewrite       grade      generate
+```
 
-An offline RAGAS evaluation harness exists / is planned for:
+The important principle is:
+
+> **First maximize candidate recall, then maximize evidence precision.**
+
+Dense and BM25 search are candidate generators. The cross-encoder is the precision stage.
+
+---
+
+# 10. Why We Are Not Using PostgreSQL for BM25
+
+PostgreSQL already has legitimate responsibilities:
+
+```text
+LangGraph checkpoints
+Document registry
+Application metadata
+```
+
+BM25 fundamentally requires an inverted text index.
+
+For the current project scale, a local persistent BM25 index is simpler and avoids introducing a second database responsibility.
+
+The intended architecture is therefore:
+
+```text
+Pinecone → dense retrieval / cloud
+BM25     → local sparse retrieval
+GPU      → local cross-encoder reranking
+LLM APIs → generation / grading / rewriting
+Postgres → checkpoint + registry
+```
+
+---
+
+# 11. GPU Strategy
+
+The development machine has:
+
+```text
+NVIDIA GeForce RTX 3060
+12 GB VRAM
+```
+
+The planned GPU workload is the local cross-encoder reranker.
+
+The design deliberately does **not** move the whole application onto the local GPU.
+
+This preserves scalability:
+
+```text
+Cloud/API:
+  LLM inference
+  Pinecone
+
+Local GPU:
+  bounded reranking workload
+```
+
+If the application is later deployed to infrastructure without a GPU, the reranker should support CPU fallback.
+
+---
+
+# 12. Expected Code Changes for Retrieval Upgrade
+
+The planned implementation is incremental.
+
+### New retrieval modules
+
+```text
+src/agentic_rag/retrieval/
+├── vectorstore.py       existing dense retrieval
+├── bm25.py              new sparse retrieval
+├── fusion.py            new RRF implementation
+├── reranker.py          new cross-encoder implementation
+└── hybrid.py            new retrieval orchestrator
+```
+
+### Existing components expected to change later
+
+```text
+config.py
+ingestion/pipeline.py
+ingestion/registry.py / local corpus storage
+retrieval/vectorstore.py
+retrieval policy
+RAGState
+nodes.py
+tests
+```
+
+The graph topology should remain largely unchanged.
+
+The goal is to replace the **retrieval implementation**, not redesign LangGraph again.
+
+---
+
+# 13. Evaluation Strategy
+
+Evaluation will compare retrieval architectures rather than tuning one score threshold forever.
+
+The intended comparison is:
+
+```text
+A. Dense only
+B. Dense + BM25
+C. Dense + BM25 + RRF
+D. Dense + BM25 + RRF + Cross-encoder
+```
+
+Metrics should include:
+
+### Retrieval
+
+- recall@K;
+- precision@K;
+- ranking quality;
+- candidate recovery from lexical queries;
+- cross-encoder ranking quality.
+
+### RAG answer quality
+
+RAGAS can later evaluate:
 
 - faithfulness;
-- relevancy;
+- answer relevancy;
 - context precision;
 - context recall.
 
-It should remain separate from the live query path.
+### System performance
 
-### Future evaluation expansion
+Track:
 
-Agentic evaluation should include:
+- dense retrieval latency;
+- BM25 latency;
+- RRF latency;
+- reranker latency;
+- LLM latency;
+- total request latency;
+- number of retrieval retries;
+- number of LLM calls.
 
-- retrieval relevance;
-- answer faithfulness;
-- context utilization;
-- tool selection accuracy;
-- tool-call success rate;
-- number of tool calls;
-- number of iterations;
-- latency;
-- hallucination rate;
-- final answer quality.
+RAGAS is therefore an **evaluation layer**, not a replacement for retrieval itself.
 
 ---
 
-# 22. Important Design Decisions
+# 14. Current vs Target Architecture
 
-| Decision | Reason |
-|---|---|
-| LangGraph instead of a linear chain | Enables conditional routing, corrective retrieval, and verification loops |
-| Pinecone instead of local-only vector storage | Supports persistent/deployable retrieval |
-| PostgreSQL checkpointer | Conversation state survives process restarts/redeployments |
-| FastAPI between UI and graph | Keeps LangGraph internals out of the frontend |
-| Streamlit as thin client | Presentation layer remains separate from RAG logic |
-| `question` separate from `retrieval_query` | Retrieval rewriting must not destroy user formatting/style instructions |
-| Whole-document overview | Broad document-level questions need document-level information |
-| Document registry separate from semantic retrieval | Upload metadata is not the same as document content |
-| Corrective retrieval | Poor retrieval can trigger query rewriting and another retrieval attempt |
-| Hallucination check | Prevents unsupported answers from being accepted silently |
-| Tool layer comes after stable RAG | Existing RAG should become a reliable capability rather than being rebuilt unnecessarily |
-
----
-
-# 23. Known Gaps / Honest TODOs
-
-The following are **not yet complete** unless the current source code explicitly shows otherwise:
-
-- True dense + sparse/BM25 hybrid search.
-- Post-retrieval reranking.
-- Web search fallback/tool.
-- Calculator tool.
-- RAG exposed as an agent tool.
-- LLM-driven tool selection.
-- Multi-step tool execution loop.
-- Proper hallucination correction that changes/retrieves better evidence.
-- Automatic RAGAS evaluation in development/deployment.
-- Agent evaluation.
-- Agent tracing/observability dashboard.
-- Strong distinction between follow-up questions and unrelated new questions.
-- MCP integration.
-- SQL/database tool.
-- Production deployment validation.
-- Consolidation/optimization of PostgreSQL connections across checkpointer and registry.
+| Area | Current | Target |
+|---|---|---|
+| Semantic retrieval | Pinecone dense | Pinecone dense |
+| Sparse retrieval | Not implemented | Local BM25 |
+| Candidate fusion | Dense ranking only | RRF |
+| Reranking | None | Cross-encoder |
+| Reranker execution | N/A | RTX 3060 GPU with CPU fallback |
+| Relevance policy | Bi-encoder score heuristics | Reranked evidence + policy |
+| LLM grader | Used for ambiguous cases | Retained as expensive tie-breaker |
+| Query rewrite | Corrective loop | Corrective loop + validation |
+| Conversation policy | Implemented | Retain/refine |
+| Generation policy | Implemented | Retain/refine |
+| Hallucination check | Implemented | Retain/refine |
+| Evaluation | RAGAS harness exists | Retrieval + RAGAS evaluation |
+| PostgreSQL | Checkpoint + registry | Same responsibilities |
 
 ---
 
-# 24. What NOT to Do
+# 15. Important Architectural Rules Going Forward
 
-Do not:
+1. **Do not redesign the LangGraph topology unless a concrete failure requires it.**
+2. **Do not keep tuning Pinecone similarity thresholds as the primary retrieval solution.**
+3. **Do not mix dense and BM25 scores directly. Use rank fusion.**
+4. **Do not make BM25 depend on PostgreSQL unless scale later requires it.**
+5. **Do not call the cross-encoder once per entire document corpus. Rerank only a bounded candidate set.**
+6. **Do not load the cross-encoder for every request. Load it once and reuse it.**
+7. **Do not send every query to the expensive LLM grader. Use reranking to narrow the ambiguity.**
+8. **Do not allow malformed rewritten queries directly back into retrieval.**
+9. **Do not treat `grounded` as equivalent to `answered`.**
+10. **Do not modify multiple major retrieval components at once without an isolated test.**
 
-- add tools randomly without a routing reason;
-- introduce multiple agents before the single-agent tool loop works;
-- replace the current RAG architecture without evidence that it is necessary;
-- tune retrieval blindly without inspecting retrieved chunks;
-- interpret `"I don't know"` as a hallucination;
-- interpret `"grounded"` as proof that the question was answered;
-- add MCP before understanding ordinary tool calling;
-- add hybrid search/reranking merely because they sound advanced;
-- change multiple pipeline layers at once during debugging.
+---
 
-The project is being developed deliberately from:
+# 16. Immediate Development Order
 
 ```text
-Reliable RAG
-    ↓
-Observable RAG
-    ↓
-Tool-enabled agent
-    ↓
-Advanced agentic system
+CURRENT BASELINE
+      │
+      ▼
+1. Build local BM25 corpus/index
+      │
+      ▼
+2. Test BM25 independently
+      │
+      ▼
+3. Keep Pinecone unchanged
+      │
+      ▼
+4. Implement RRF
+      │
+      ▼
+5. Test dense vs BM25 vs RRF
+      │
+      ▼
+6. Add cross-encoder
+      │
+      ▼
+7. Test CPU/GPU reranking + latency
+      │
+      ▼
+8. Integrate hybrid retrieval into retrieve()
+      │
+      ▼
+9. Update RAGState / trace
+      │
+      ▼
+10. Replace old bi-encoder confidence policy
+      │
+      ▼
+11. Re-evaluate grading + rewriting
+      │
+      ▼
+12. Run retrieval evaluation + RAGAS
+      │
+      ▼
+13. Optimize remaining bottlenecks
 ```
+
+No BM25, RRF, or cross-encoder implementation should be considered complete until its isolated tests pass.
 
 ---
 
-# 25. Development Commands
+# 17. Later Agentic Phase
 
-## Start FastAPI
+Once retrieval quality is stable, the project can continue toward true Agentic RAG:
 
-From the project root:
+```text
+User
+  ↓
+Agent
+  ├── RAG tool
+  ├── Web search
+  ├── Calculator
+  ├── Document metadata
+  └── Future MCP tools
+```
+
+The agent should select tools conditionally and inspect tool results before answering.
+
+MCP should be introduced after ordinary tool calling is understood and stable.
+
+---
+
+# 18. Development Commands
+
+### FastAPI
 
 ```powershell
 uvicorn agentic_rag.api.main:app --reload
 ```
 
-Expected:
-
-```text
-Uvicorn running on http://127.0.0.1:8000
-Application startup complete.
-```
-
-## Start Streamlit
-
-In another terminal:
+### Streamlit
 
 ```powershell
 streamlit run app/streamlit_app.py
 ```
 
-## Health check
+### Health
 
 ```text
 http://127.0.0.1:8000/health
 ```
 
-Expected:
+---
 
-```json
-{"status": "ok"}
-```
+# 19. Handoff Summary
+
+**The project currently has a stable corrective-RAG foundation built around FastAPI, Streamlit, LangGraph, Pinecone, provider-based LLM inference, PostgreSQL checkpointing, document registry, conversation policies, retrieval policies, generation policies, relevance grading, query rewriting, grounded generation, hallucination checking, and performance tracing. The major retrieval weakness is the reliance on dense bi-encoder similarity as both retrieval and relevance signal. Rather than continuing to tune thresholds, the next optimization is a true multi-stage retrieval architecture: Pinecone dense retrieval + local BM25 sparse retrieval → RRF fusion → local GPU cross-encoder reranking → retrieval assessment. PostgreSQL remains for checkpointing/registry, while cloud APIs remain responsible for LLM inference. The LangGraph topology should remain stable while the retrieval subsystem is upgraded incrementally and evaluated at every stage.**
 
 ---
 
-# 26. Current Development Order
+# 20. Golden Rule
 
-The intended development order from this point is:
-
-```text
-CURRENT
-│
-├── Stable conversational UI                         ✅
-├── FastAPI backend                                  ✅
-├── PostgreSQL checkpointing                        ✅
-├── Pinecone retrieval                               ✅
-├── Corrective RAG                                   ✅
-├── Contextual follow-up support                    ✅/refine
-├── Debug/observability                             🔧
-│
-▼
-NEXT
-│
-├── RAG as a tool
-├── Calculator tool
-├── Web search tool
-├── Agent tool selection
-├── Tool execution loop
-├── Multi-step tool use
-├── Tool-result reasoning
-│
-▼
-LATER
-│
-├── Better planning
-├── Better memory
-├── Evaluation
-├── Tracing
-├── MCP
-├── SQL / external tools
-└── Production deployment
-```
-
----
-
-# 27. Current Project Position — One-Paragraph Handoff
-
-**This project is a FastAPI + Streamlit + LangGraph Agentic RAG application. It ingests PDFs/images/audio, chunks and embeds the content, stores vectors in Pinecone, generates document overviews, and uses a corrective LangGraph RAG pipeline with contextualized queries, retrieval, relevance grading, query rewriting/re-retrieval, grounded generation, hallucination checking, and PostgreSQL-backed conversation state. The Streamlit UI now behaves as a persistent conversational interface and sends the same session ID for follow-ups and new questions. The RAG layer is considered approximately 7/10 maturity: advanced/corrective RAG, but not yet a true tool-using agent. The next major phase is to expose the existing RAG retrieval capability as a tool, add calculator and web-search tools, implement LLM-driven tool selection and a tool execution loop, and only then progress toward MCP, multi-step planning, evaluation, and advanced agentic behavior.**
-
----
-
-# 28. Session Startup Instruction for Another Chatbot
-
-When this file is loaded into a new session, the assistant should assume:
-
-> The user is continuing development of the Agentic RAG project described in this document. Do not ask the user to explain the project from scratch. First use this file to understand the architecture, completed work, known issues, and next milestone. If source code is provided, inspect the current source before relying on historical values in this document. Clearly distinguish completed features, current implementation, planned features, and unresolved gaps. Prefer incremental changes over unnecessary rewrites.
-
----
-
-# 29. Source Reference
-
-This document was based on the project's existing `PROJECT_NOTES.md` reference and the development history established during the current project work.
-
-Where historical notes and current source code disagree, **current source code wins**.
-
-This document should be updated whenever a major architectural decision, implementation milestone, debugging discovery, or roadmap change occurs.
-
----
-
-# 30. Change Log
-
-## Initial project
-
-- Started as a RAG-focused application.
-- Established document ingestion, embeddings, vector storage, and LLM generation.
-- Moved toward LangGraph to support corrective workflows.
-
-## Retrieval architecture
-
-- Moved to Pinecone for persistent/deployable vector storage.
-- Added document overview generation.
-- Added corrective relevance grading and query rewriting.
-
-## Persistence
-
-- Replaced in-process memory with PostgreSQL/LangGraph checkpointing.
-- Connected FastAPI lifespan to checkpointer lifecycle.
-
-## Backend
-
-- Added FastAPI REST boundary.
-- Added `/query`, `/ingest`, and `/health`.
-
-## Frontend
-
-- Streamlit became a thin API client.
-- Added persistent visible chat history.
-- Added support for multiple questions in one conversation.
-- Preserved the same backend session ID for follow-ups.
-
-## Debugging
-
-- Diagnosed Uvicorn import-path issue.
-- Diagnosed PostgreSQL port mismatch:
-  - application originally attempted `5442`;
-  - local PostgreSQL was actually listening on `5432`;
-  - Docker had no running containers.
-- Identified misleading interpretation of:
-  - `I don't know`
-  - `grounded`.
-- Identified overly restrictive generation instruction:
-  - `Keep the answer concise.`
-- Identified that `contextualize_question()` existed but needed to be connected into the graph.
-
-## Current direction
-
-The project is now moving from:
-
-```text
-Corrective RAG
-```
-
-to:
-
-```text
-Agentic RAG
-```
-
-by adding tool access and LLM-driven tool selection while keeping the existing RAG subsystem as a reliable capability.
-
----
-
-# 31. Golden Rule
-
-**Do not rebuild what already works.**
-
-The current RAG should become the foundation of the agentic system.
-
-The next architectural question is not:
-
-> "How do we make the RAG more complicated?"
-
-It is:
-
-> **"How does an agent decide when to use this RAG capability, when to use another tool, and when it has enough information to answer?"**
+> **Do not rebuild what already works. Improve one layer at a time, measure it, and preserve the working graph architecture.**
