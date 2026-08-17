@@ -22,7 +22,7 @@ from agentic_rag.config import settings
 from agentic_rag.graph.state import RAGState
 from agentic_rag.llm.provider import provider_chain, fast_provider_chain
 from agentic_rag.retrieval.vectorstore import retrieve_with_scores
-from agentic_rag.graph.query_utils import is_likely_follow_up
+from agentic_rag.policies.conversation  import classify_query_intent
 from agentic_rag.policies.retrieval import assess_retrieval_confidence
 from agentic_rag.policies.generation import apply_generation_limits, is_refusal_answer
 from agentic_rag.core.timing import PerformanceTracker
