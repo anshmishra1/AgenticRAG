@@ -2,18 +2,23 @@
 real, labeled query/document pairs - not a guess, not RAGAS (which measures
 generation quality, not retrieval score separation).
 
+IMPORTANT: after the hybrid search + cross-encoder reranking change, the
+score this script measures is a cross-encoder relevance score (sigmoid-
+activated), NOT raw Pinecone cosine similarity. Re-run this against your
+labeled set before trusting the config.py defaults - the old cosine-based
+numbers (and even the previous calibration run's numbers) no longer apply,
+since the score source itself changed.
+
 Usage:
-    1. Ingest the documents you want to calibrate against, as usual.
+    1. Ingest the documents you want to calibrate against, as usual (through
+       the hybrid-capable index - see scripts/create_hybrid_index.py).
     2. Fill in LABELED_QUERIES below with real questions, the document_id
        each is scoped to, and whether that pairing SHOULD match (True) or
-       is a deliberate mismatch (False) - e.g. asking an LLM-foundations
-       question while scoped to an unrelated book.
-    3. Run: python scripts/calibrate_retrieval.py
+       is a deliberate mismatch (False).
+    3. Run: python -m agentic_rag.policies.calibrate_retrieval
     4. It prints the top-score distribution for "should match" vs "should
-       not match" pairs, and suggests where retrieval_min_top_score and
-       retrieval_strong_top_score should sit given the actual gap between
-       the two clusters - the same exercise we did informally from one
-       trace, done properly across multiple examples.
+       not match" pairs, and suggests where the two thresholds should sit
+       given the actual gap between the two clusters.
 
 Add more rows over time as you find new failure cases - this script becomes
 more trustworthy the more real examples it has, the same way any eval set does.
@@ -21,7 +26,11 @@ more trustworthy the more real examples it has, the same way any eval set does.
 from __future__ import annotations
 
 from agentic_rag.graph.nodes import calculate_retrieval_metrics
-from agentic_rag.retrieval.vectorstore import retrieve_with_scores
+from agentic_rag.ingestion.registry import get_bm25_params
+from agentic_rag.retrieval.reranker import rerank
+from agentic_rag.retrieval.sparse import load_bm25_json
+from agentic_rag.retrieval.vectorstore import retrieve_hybrid_with_scores
+from agentic_rag.config import settings
 
 # Fill these in with real (query, document_id, should_match) rows from your
 # own ingested documents. document_id comes from GET /documents.
@@ -31,7 +40,7 @@ LABELED_QUERIES: list[tuple[str, str, bool]] = [
     ("How are LLM's built", "8354069b86193aa9d4c6f88b576443523f00ad68b9637711ad9f801869ffa1b2", True),
     ("What are the issues with traditional Fine Tuning", "8354069b86193aa9d4c6f88b576443523f00ad68b9637711ad9f801869ffa1b2", True),
     ("Why do we still need context engineering if we already have RAG to solve these problems?", "8354069b86193aa9d4c6f88b576443523f00ad68b9637711ad9f801869ffa1b2", True),
-    
+
     # False matches (Failed semantic document grading / graded as irrelevant for this document)
     ("How to generate the dataset that will be used for fine tuning", "8354069b86193aa9d4c6f88b576443523f00ad68b9637711ad9f801869ffa1b2", False),
     ("How to create a dataset for fine-tuningmodeloos", "8354069b86193aa9d4c6f88b576443523f00ad68b9637711ad9f801869ffa1b2", False),
@@ -40,8 +49,18 @@ LABELED_QUERIES: list[tuple[str, str, bool]] = [
 
 def _top_score(query: str, document_id: str) -> float:
     content_filter = {"$and": [{"document_id": {"$eq": document_id}}, {"type": {"$eq": "content"}}]}
-    results = retrieve_with_scores(query=query, k=5, filter=content_filter)
-    scores = [float(score) for _, score in results]
+
+    bm25_params = get_bm25_params(document_id)
+    bm25_encoder = load_bm25_json(bm25_params) if bm25_params else None
+
+    candidates = retrieve_hybrid_with_scores(
+        query=query,
+        bm25_encoder=bm25_encoder,
+        k=settings.hybrid_candidate_k,
+        filter=content_filter,
+    )
+    reranked = rerank(query, candidates, top_k=settings.rerank_top_k_content)
+    scores = [score for _, score in reranked]
     return calculate_retrieval_metrics(scores)["top_score"]
 
 

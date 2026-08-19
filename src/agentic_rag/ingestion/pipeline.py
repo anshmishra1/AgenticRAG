@@ -7,7 +7,8 @@ from langchain_core.documents import Document
 from agentic_rag.ingestion.chunking import chunk_documents
 from agentic_rag.ingestion.loaders import load_audio, load_image, load_pdf
 from agentic_rag.llm.provider import provider_chain
-from agentic_rag.retrieval.vectorstore import get_vectorstore
+from agentic_rag.retrieval.sparse import dump_bm25_json, fit_bm25
+from agentic_rag.retrieval.vectorstore import upsert_hybrid
 
 _LOADERS = {
     ".pdf": load_pdf,
@@ -88,7 +89,15 @@ def ingest_file(path: str | Path, display_name: str | None = None) -> int:
         document_id=document_id,
     )
 
-    get_vectorstore().add_documents(chunks + [overview])
+    all_chunks = chunks + [overview]
+
+    # BM25 is fit per-document (see retrieval/sparse.py for why) using this
+    # document's own chunk + overview text, then persisted so query time can
+    # reconstruct the identical encoder.
+    bm25_encoder = fit_bm25([c.page_content for c in all_chunks])
+    bm25_params_json = dump_bm25_json(bm25_encoder)
+
+    upsert_hybrid(all_chunks, bm25_encoder)
 
     from agentic_rag.ingestion.registry import record_ingestion
 
@@ -96,6 +105,7 @@ def ingest_file(path: str | Path, display_name: str | None = None) -> int:
         filename,
         len(chunks),
         document_id=document_id,
+        bm25_params=bm25_params_json,
     )
 
     return len(chunks)

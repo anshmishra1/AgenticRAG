@@ -14,6 +14,8 @@ langchain-community
 langchain-text-splitters
 groq
 pinecone-client
+pinecone-text
+sentence-transformers
 fastapi
 uvicorn[standard]
 streamlit

@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     aws_bedrock_region: str = "us-east-1"
 
     # Vector database
-    pinecone_index_name: str = "agentic-rag"
+    pinecone_index_name: str = "agentic-rag-hybrid"
 
     # PostgreSQL / LangGraph checkpointing
     postgres_url: str = (
@@ -63,8 +63,16 @@ class Settings(BaseSettings):
     max_generation_output_chars: int = 12000
 
     # Retrieval assessment - absolute score gate
-    retrieval_min_top_score: float = 0.35
-    retrieval_strong_top_score: float = 0.55
+    # IMPORTANT: these were calibrated against raw Pinecone cosine similarity
+    # scores. Hybrid search + cross-encoder reranking changed the score source
+    # entirely (sigmoid-activated cross-encoder relevance, not cosine
+    # similarity) - the numbers below are a reasonable placeholder for the new
+    # scale (genuine matches from a cross-encoder+sigmoid typically land
+    # well above 0.5; clear mismatches well below 0.2), NOT a real
+    # calibration. Re-run scripts/calibrate_retrieval.py against the new
+    # retrieval path before trusting these for anything but initial testing.
+    retrieval_min_top_score: float = 0.30
+    retrieval_strong_top_score: float = 0.60
 
     # Retrieval assessment - relative shape gate (used only once the absolute
     # floor above is cleared). Moved here from module-level constants in
@@ -72,6 +80,14 @@ class Settings(BaseSettings):
     retrieval_top_to_mean_ratio: float = 1.10
     retrieval_gap_ratio: float = 0.02
     retrieval_overview_margin: float = 0.02
+
+    # Hybrid search (dense + sparse BM25) and cross-encoder reranking
+    hybrid_alpha: float = 0.5              # 1.0 = pure dense, 0.0 = pure sparse
+    hybrid_candidate_k: int = 15           # candidates pulled from Pinecone before reranking
+    rrf_k: int = 60
+    rerank_top_k_content: int = 5
+    rerank_top_k_overview: int = 2
+    cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     # Development
     debug: bool = False

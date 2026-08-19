@@ -21,7 +21,10 @@ from langchain_core.messages import AIMessage, HumanMessage
 from agentic_rag.config import settings
 from agentic_rag.graph.state import RAGState
 from agentic_rag.llm.provider import provider_chain, fast_provider_chain
-from agentic_rag.retrieval.vectorstore import retrieve_with_scores
+from agentic_rag.retrieval.vectorstore import retrieve_hybrid_with_scores
+from agentic_rag.retrieval.reranker import rerank
+from agentic_rag.retrieval.sparse import load_bm25_json
+from agentic_rag.ingestion.registry import get_bm25_params
 from agentic_rag.policies.conversation  import classify_query_intent
 from agentic_rag.policies.retrieval import assess_retrieval_confidence
 from agentic_rag.policies.generation import apply_generation_limits, is_refusal_answer
@@ -327,24 +330,41 @@ def retrieve(state: RAGState) -> dict:
                 ]
             }
             print(f"Document scope: {document_id}")
+
+            bm25_params = get_bm25_params(document_id)
+            bm25_encoder = load_bm25_json(bm25_params) if bm25_params else None
+            if bm25_encoder is None:
+                print("WARNING: no BM25 params found for this document_id -")
+                print("falling back to dense-only retrieval (document may")
+                print("predate the hybrid-search change).")
         else:
             # Backward-compatible fallback. Normal application queries should
             # provide document_id when the user is asking about one document.
             overview_filter = {"type": {"$eq": "overview"}}
             content_filter = None
-            print("Document scope: GLOBAL (no document_id supplied)")
+            bm25_encoder = None
+            print("Document scope: GLOBAL (no document_id supplied) - dense-only.")
 
-        overview_results = retrieve_with_scores(
+        # Wide recall via hybrid (dense + sparse) search, then a precise
+        # re-rank down to the final k. The recall step optimizes for not
+        # missing the right chunk; the rerank step optimizes for ordering -
+        # this is why hybrid_candidate_k is deliberately larger than the
+        # final rerank_top_k values below.
+        overview_candidates = retrieve_hybrid_with_scores(
             query=query,
-            k=2,
+            bm25_encoder=bm25_encoder,
+            k=settings.hybrid_candidate_k,
             filter=overview_filter,
         )
-
-        content_results = retrieve_with_scores(
+        content_candidates = retrieve_hybrid_with_scores(
             query=query,
-            k=5,
+            bm25_encoder=bm25_encoder,
+            k=settings.hybrid_candidate_k,
             filter=content_filter,
         )
+
+        overview_results = rerank(query, overview_candidates, top_k=settings.rerank_top_k_overview)
+        content_results = rerank(query, content_candidates, top_k=settings.rerank_top_k_content)
 
         results = overview_results + content_results
         results.sort(key=lambda item: float(item[1]), reverse=True)
@@ -359,13 +379,13 @@ def retrieve(state: RAGState) -> dict:
         overview_top_score = _top_score_for_type(results, "overview")
         content_top_score = _top_score_for_type(results, "content")
 
-        print(f"\nOverview chunks retrieved: {overview_docs_count}")
-        print(f"Content chunks retrieved: {content_docs_count}")
+        print(f"\nOverview candidates (hybrid): {len(overview_candidates)} -> reranked to {overview_docs_count}")
+        print(f"Content candidates (hybrid): {len(content_candidates)} -> reranked to {content_docs_count}")
 
         for i, doc in enumerate(docs, start=1):
             print("\n" + "-" * 60)
             print(f"DOCUMENT {i}")
-            print(f"Similarity score: {scores[i - 1]}")
+            print(f"Cross-encoder relevance score: {scores[i - 1]}")
             print(f"Metadata: {doc.metadata}")
             print(f"\nContent preview:\n{_preview(doc.page_content)}")
 
@@ -409,6 +429,7 @@ def retrieve(state: RAGState) -> dict:
                 "gap_ratio": metrics["gap_ratio"],
                 "overview_top_score": overview_top_score,
                 "content_top_score": content_top_score,
+                "retrieval_method": "hybrid+rerank" if bm25_encoder else "dense+rerank",
             }],
         }
 
