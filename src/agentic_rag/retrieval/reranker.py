@@ -43,7 +43,13 @@ def rerank(
     candidates: list[tuple[Document, float]],
     top_k: int,
 ) -> list[tuple[Document, float]]:
-    """Re-score candidates and print incoming RRF + raw/sigmoid CE scores."""
+    """Re-rank hybrid candidates with the cross-encoder.
+
+    The incoming score is preserved as RRF metadata.
+    The cross-encoder score remains the returned score so the existing
+    retrieval/graph contract is not changed in this stage.
+    """
+
     if not candidates:
         print("\n" + "-" * 70)
         print("CROSS-ENCODER RERANKER")
@@ -52,42 +58,93 @@ def rerank(
         return []
 
     print("\n" + "-" * 70)
-    print(f"CROSS-ENCODER RERANKER | candidates={len(candidates)} | top_k={top_k}")
+    print(
+        f"CROSS-ENCODER RERANKER | "
+        f"candidates={len(candidates)} | top_k={top_k}"
+    )
     print("-" * 70)
     print(f"Model: {settings.cross_encoder_model}")
 
-    pairs = [(query, doc.page_content) for doc, _ in candidates]
-    raw_scores = np.asarray(_get_cross_encoder().predict(pairs))
+    pairs = [
+        (query, doc.page_content)
+        for doc, _ in candidates
+    ]
+
+    raw_scores = np.asarray(
+        _get_cross_encoder().predict(pairs)
+    )
+
     scores = _sigmoid(raw_scores)
 
-    scored = []
-    for original_rank, ((doc, incoming_rrf), raw_score, score) in enumerate(
-        zip(candidates, raw_scores, scores), start=1
+    scored_candidates = []
+
+    for original_rank, (
+        (doc, rrf_score),
+        raw_score,
+        ce_score,
+    ) in enumerate(
+        zip(candidates, raw_scores, scores),
+        start=1,
     ):
-        scored.append({
-            "original_rank": original_rank,
-            "incoming_rrf": float(incoming_rrf),
-            "raw_logit": float(raw_score),
-            "cross_encoder_score": float(score),
-            "doc": doc,
-        })
+        # Do not overwrite the existing retrieval score contract.
+        # Preserve all retrieval-stage information in metadata.
+        doc.metadata["_retrieval_rrf_score"] = float(rrf_score)
+        doc.metadata["_cross_encoder_logit"] = float(raw_score)
+        doc.metadata["_cross_encoder_score"] = float(ce_score)
+        doc.metadata["_reranker_previous_rank"] = original_rank
 
-    scored.sort(key=lambda item: item["cross_encoder_score"], reverse=True)
-
-    for rerank_position, item in enumerate(scored, start=1):
-        md = item["doc"].metadata
-        print(
-            f"[{rerank_position:02d}] "
-            f"CE={item['cross_encoder_score']:.6f} | "
-            f"logit={item['raw_logit']:.6f} | "
-            f"RRF={item['incoming_rrf']:.8f} | "
-            f"previous_rank={item['original_rank']} | "
-            f"type={md.get('type')} | "
-            f"page={md.get('page_label', md.get('page', '-'))}"
+        scored_candidates.append(
+            (
+                doc,
+                float(ce_score),
+                float(rrf_score),
+                float(raw_score),
+                original_rank,
+            )
         )
 
-    selected = scored[:top_k]
-    print(f"Selected top {len(selected)} candidates after cross-encoder reranking.")
+    scored_candidates.sort(
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    for rerank_position, (
+        doc,
+        ce_score,
+        rrf_score,
+        raw_score,
+        original_rank,
+    ) in enumerate(
+        scored_candidates,
+        start=1,
+    ):
+        metadata = doc.metadata
+
+        print(
+            f"[{rerank_position:02d}] "
+            f"CE={ce_score:.6f} | "
+            f"logit={raw_score:.6f} | "
+            f"RRF={rrf_score:.8f} | "
+            f"previous_rank={original_rank} | "
+            f"type={metadata.get('type')} | "
+            f"page={metadata.get('page_label', metadata.get('page', '-'))}"
+        )
+
+    selected = scored_candidates[:top_k]
+
+    print(
+        f"Selected top {len(selected)} candidates "
+        f"after cross-encoder reranking."
+    )
     print("-" * 70)
 
-    return [(item["doc"], item["cross_encoder_score"]) for item in selected]
+    return [
+        (doc, ce_score)
+        for (
+            doc,
+            ce_score,
+            _rrf_score,
+            _raw_score,
+            _original_rank,
+        ) in selected
+    ]

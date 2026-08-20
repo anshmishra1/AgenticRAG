@@ -1,33 +1,29 @@
 """Retrieval confidence policy.
 
-Replaces the old binary check (strong -> skip grading / else -> grade) with a
-three-way gate:
+The retrieval pipeline now uses:
 
-  1. Below an ABSOLUTE score floor  -> weak.    Skip grading, go straight to
-     query rewrite. No point asking an LLM to grade context we're already
-     confident is unrelated to the question.
-  2. Above the floor AND a confident relative shape -> strong. Skip grading,
-     go straight to generation.
-  3. Everything in between -> ambiguous. Defer to the LLM grader - this is
-     exactly where a cheap heuristic is least reliable, so don't trust it here.
+    Dense + BM25
+        ↓
+       RRF
+        ↓
+Cross-encoder reranking
+        ↓
+retrieval assessment
 
-Why an absolute floor was missing before, and why that mattered: the old
-check only looked at RELATIVE shape (top-to-mean ratio, gap ratio). Six
-uniformly weak, barely-related scores can still produce a "confident-looking"
-ratio purely because they're not identical to each other - there's nothing in
-a relative-only check that can tell "these are strong matches" apart from
-"these are six weak matches where one happens to be less weak than the rest."
-A real production trace caught this exactly: a query against the wrong
-document returned scores of [0.23, 0.17, 0.15, 0.15, 0.13, -0.06] and was
-still classified "strong" by the old logic, because the ratios looked fine.
+The cross-encoder sigmoid score is NOT treated as a calibrated probability.
+It is primarily used for ranking.
 
-The absolute thresholds below (retrieval_min_top_score=0.35,
-retrieval_strong_top_score=0.55) are calibrated from that trace's real score
-clusters: genuine matches scored 0.55-0.63, genuine mismatches scored
-0.04-0.23. Treat these as a starting point backed by one real trace, not a
-rigorous calibration - see scripts/calibrate_retrieval.py to refine them
-against a larger labeled set.
+Confidence therefore combines:
+    1. top-vs-second separation
+    2. top-vs-mean separation
+    3. minimum ranking evidence
+    4. retry state
+    5. overview/content evidence where available
+
+The policy deliberately avoids treating the old Pinecone cosine-score
+thresholds as valid for the new cross-encoder score distribution.
 """
+
 from __future__ import annotations
 
 from agentic_rag.config import settings
@@ -40,56 +36,136 @@ def assess_retrieval_confidence(
     content_top_score: float | None,
     retry_count: int = 0,
 ) -> dict:
-    """Returns {"decision": ..., "evidence_strength": ..., "reason": ...}.
+    """Classify retrieved evidence as strong, ambiguous, or weak.
 
-    decision is one of "generate" | "grade" | "rewrite_query".
-    retry_count guards against the weak-evidence branch looping forever:
-    once max_retries is hit, weak evidence falls through to "grade" (the LLM
-    gets one last say) instead of rewriting indefinitely.
+    Returns:
+        {
+            "decision": "generate" | "grade" | "rewrite_query",
+            "evidence_strength": "strong" | "ambiguous" | "weak",
+            "reason": str,
+        }
+
+    Important:
+        Cross-encoder sigmoid scores are ranking signals, not calibrated
+        probabilities. Therefore absolute CE thresholds are deliberately
+        not used as the primary decision mechanism.
     """
-    top_score = metrics["top_score"]
-    top_to_mean = metrics["top_to_mean_ratio"]
-    gap_ratio = metrics["gap_ratio"]
 
-    overview_dominant = (
-        top_doc_type == "overview"
-        and overview_top_score is not None
-        and content_top_score is not None
-        and overview_top_score >= content_top_score * (1.0 + settings.retrieval_overview_margin)
+    top_score = float(metrics.get("top_score", 0.0))
+    second_score = float(metrics.get("second_score", 0.0))
+    mean_score = float(metrics.get("mean_score", 0.0))
+
+    top_to_mean = float(
+        metrics.get("top_to_mean_ratio", 0.0)
+    )
+    gap_ratio = float(
+        metrics.get("gap_ratio", 0.0)
     )
 
-    # 1. Absolute floor - checked first, regardless of relative shape.
-    if top_score < settings.retrieval_min_top_score:
+    score_gap = top_score - second_score
+
+    # ---------------------------------------------------------
+    # 1. No usable retrieval evidence
+    # ---------------------------------------------------------
+    if top_score <= 0.0 or not metrics:
         if retry_count >= settings.max_retries:
             return {
                 "decision": "grade",
                 "evidence_strength": "weak",
-                "reason": "weak_evidence_retries_exhausted",
+                "reason": "no_usable_retrieval_evidence_retries_exhausted",
             }
+
         return {
             "decision": "rewrite_query",
             "evidence_strength": "weak",
-            "reason": "absolute_score_below_floor",
+            "reason": "no_usable_retrieval_evidence",
         }
 
-    # 2. Strong evidence requires BOTH a healthy absolute score and a
-    # confident relative shape - either signal alone isn't enough.
-    strong_by_distribution = (
-        top_score >= settings.retrieval_strong_top_score
-        and top_to_mean >= settings.retrieval_top_to_mean_ratio
+    # ---------------------------------------------------------
+    # 2. Very weak distribution
+    #
+    # The top result is not sufficiently separated from the
+    # remaining candidates.
+    # ---------------------------------------------------------
+    weak_distribution = (
+        top_to_mean < settings.retrieval_top_to_mean_ratio
+        and gap_ratio < settings.retrieval_gap_ratio
+    )
+
+    if weak_distribution:
+        if retry_count >= settings.max_retries:
+            return {
+                "decision": "grade",
+                "evidence_strength": "weak",
+                "reason": "weak_distribution_retries_exhausted",
+            }
+
+        return {
+            "decision": "rewrite_query",
+            "evidence_strength": "weak",
+            "reason": "weak_candidate_separation",
+        }
+
+    # ---------------------------------------------------------
+    # 3. Strong evidence
+    #
+    # We require BOTH:
+    #
+    #   - meaningful top-vs-mean separation
+    #   - meaningful top-vs-second separation
+    #
+    # This prevents one tiny numerical difference from being
+    # interpreted as strong evidence.
+    # ---------------------------------------------------------
+    strong_distribution = (
+        top_to_mean >= settings.retrieval_top_to_mean_ratio
         and gap_ratio >= settings.retrieval_gap_ratio
     )
-    strong_by_overview = overview_dominant and gap_ratio >= settings.retrieval_gap_ratio
 
-    if strong_by_distribution or strong_by_overview:
-        reason = "overview_dominant_with_clear_margin" if (strong_by_overview and not strong_by_distribution) else "strong_score_distribution"
-        return {"decision": "generate", "evidence_strength": "strong", "reason": reason}
+    if strong_distribution:
+        return {
+            "decision": "generate",
+            "evidence_strength": "strong",
+            "reason": "strong_cross_encoder_score_distribution",
+        }
 
-    # 3. Ambiguous - defer to the LLM grader.
+    # ---------------------------------------------------------
+    # 4. Overview evidence
+    #
+    # An overview chunk can legitimately answer broad document-level
+    # questions even if individual content chunks have weaker scores.
+    # ---------------------------------------------------------
+    overview_dominant = (
+        top_doc_type == "overview"
+        and overview_top_score is not None
+        and content_top_score is not None
+        and overview_top_score
+        >= content_top_score
+        * (1.0 + settings.retrieval_overview_margin)
+    )
+
+    if overview_dominant and gap_ratio >= settings.retrieval_gap_ratio:
+        return {
+            "decision": "generate",
+            "evidence_strength": "strong",
+            "reason": "overview_dominant_with_clear_margin",
+        }
+
+    # ---------------------------------------------------------
+    # 5. Ambiguous evidence
+    #
+    # The retrieval has signal, but not enough confidence to
+    # bypass semantic grading.
+    # ---------------------------------------------------------
     if gap_ratio < settings.retrieval_gap_ratio:
         reason = "top_candidates_too_close"
     elif top_to_mean < settings.retrieval_top_to_mean_ratio:
         reason = "weak_top_candidate_separation"
     else:
         reason = "retrieval_requires_semantic_grading"
-    return {"decision": "grade", "evidence_strength": "ambiguous", "reason": reason}
+
+    return {
+        "decision": "grade",
+        "evidence_strength": "ambiguous",
+        "reason": reason,
+    }

@@ -13,6 +13,8 @@ The existing document_id-scoped retrieval and provider tiers are preserved.
 """
 from __future__ import annotations
 
+import hashlib
+import re
 import json
 import logging
 
@@ -302,6 +304,70 @@ def _top_score_for_type(results: list[tuple], chunk_type: str) -> float | None:
     ]
     return max(scores) if scores else None
 
+def _normalize_chunk_text(text: str) -> str:
+    """Normalize chunk text for stable query-time deduplication."""
+
+    return " ".join(text.lower().split())
+
+
+def _candidate_identity(doc) -> tuple:
+    """Build a stable identity for a retrieved chunk.
+
+    This intentionally operates only at query time. It does not modify
+    ingestion, indexing, chunk IDs, or persisted data.
+    """
+
+    metadata = doc.metadata
+
+    document_id = metadata.get("document_id", "")
+    chunk_type = metadata.get("type", "")
+    page = metadata.get(
+        "page_label",
+        metadata.get("page", ""),
+    )
+
+    normalized_text = _normalize_chunk_text(
+        doc.page_content
+    )
+
+    content_hash = hashlib.sha256(
+        normalized_text.encode("utf-8")
+    ).hexdigest()[:16]
+
+    return (
+        document_id,
+        chunk_type,
+        str(page),
+        content_hash,
+    )
+
+
+def _deduplicate_candidates(
+    candidates: list[tuple],
+) -> tuple[list[tuple], int]:
+    """Remove duplicate chunks while preserving ranking order.
+
+    The first occurrence wins because RRF already sorted candidates by
+    relevance before this function is called.
+    """
+
+    seen = set()
+    deduplicated = []
+    removed = 0
+
+    for candidate in candidates:
+        doc = candidate[0]
+
+        identity = _candidate_identity(doc)
+
+        if identity in seen:
+            removed += 1
+            continue
+
+        seen.add(identity)
+        deduplicated.append(candidate)
+
+    return deduplicated, removed
 
 # =============================================================
 # Retrieval
@@ -356,6 +422,7 @@ def retrieve(state: RAGState) -> dict:
             k=settings.hybrid_candidate_k,
             filter=overview_filter,
         )
+
         content_candidates = retrieve_hybrid_with_scores(
             query=query,
             bm25_encoder=bm25_encoder,
@@ -363,8 +430,49 @@ def retrieve(state: RAGState) -> dict:
             filter=content_filter,
         )
 
-        overview_results = rerank(query, overview_candidates, top_k=settings.rerank_top_k_overview)
-        content_results = rerank(query, content_candidates, top_k=settings.rerank_top_k_content)
+        # ---------------------------------------------------------
+        # Query-time candidate deduplication
+        # ---------------------------------------------------------
+        overview_candidates, overview_duplicates_removed = (
+            _deduplicate_candidates(overview_candidates)
+        )
+
+        content_candidates, content_duplicates_removed = (
+            _deduplicate_candidates(content_candidates)
+        )
+
+        print("\n" + "-" * 70)
+        print("HYBRID CANDIDATE DEDUPLICATION")
+        print("-" * 70)
+
+        print(
+            f"Overview: "
+            f"{len(overview_candidates) + overview_duplicates_removed} "
+            f"-> {len(overview_candidates)} "
+            f"({overview_duplicates_removed} duplicates removed)"
+        )
+
+        print(
+            f"Content: "
+            f"{len(content_candidates) + content_duplicates_removed} "
+            f"-> {len(content_candidates)} "
+            f"({content_duplicates_removed} duplicates removed)"
+        )
+
+        # ---------------------------------------------------------
+        # Cross-encoder reranking
+        # ---------------------------------------------------------
+        overview_results = rerank(
+            query,
+            overview_candidates,
+            top_k=settings.rerank_top_k_overview,
+        )
+
+        content_results = rerank(
+            query,
+            content_candidates,
+            top_k=settings.rerank_top_k_content,
+        )
 
         results = overview_results + content_results
         results.sort(key=lambda item: float(item[1]), reverse=True)
@@ -429,10 +537,47 @@ def retrieve(state: RAGState) -> dict:
                 "gap_ratio": metrics["gap_ratio"],
                 "overview_top_score": overview_top_score,
                 "content_top_score": content_top_score,
-                "retrieval_method": "hybrid+rerank" if bm25_encoder else "dense+rerank",
-            }],
+                "retrieval_method": (
+                    "dense+bm25+rrf+cross_encoder"
+                    if bm25_encoder
+                    else "dense+cross_encoder"
+                ),
+                "deduplication": {
+                    "overview_candidates_before": (
+                        len(overview_candidates)
+                        + overview_duplicates_removed
+                    ),
+                    "overview_candidates_after": len(overview_candidates),
+                    "overview_duplicates_removed": overview_duplicates_removed,
+                    "content_candidates_before": (
+                        len(content_candidates)
+                        + content_duplicates_removed
+                    ),
+                    "content_candidates_after": len(content_candidates),
+                    "content_duplicates_removed": content_duplicates_removed,
+                },
+                "reranker_scores": [
+                    {
+                        "rank": rank,
+                        "page": doc.metadata.get(
+                            "page_label",
+                            doc.metadata.get("page"),
+                        ),
+                        "type": doc.metadata.get("type"),
+                        "rrf_score": doc.metadata.get(
+                            "_retrieval_rrf_score"
+                        ),
+                        "cross_encoder_logit": doc.metadata.get(
+                            "_cross_encoder_logit"
+                        ),
+                        "cross_encoder_score": doc.metadata.get(
+                            "_cross_encoder_score"
+                        ),
+                    }
+                    for rank, doc in enumerate(docs, start=1)
+                ]
+            }]
         }
-
 
 # =============================================================
 # Retrieval assessment — NEW optimization layer
@@ -474,11 +619,17 @@ def assess_retrieval(state: RAGState) -> dict:
             evidence_strength = result["evidence_strength"]
             reason = result["reason"]
 
-            print(f"Top score: {metrics['top_score']:.4f}")
-            print(f"Second score: {metrics['second_score']:.4f}")
+            print(f"Top score: {metrics['top_score']:.6f}")
+            print(f"Second score: {metrics['second_score']:.6f}")
+            print(f"Mean score: {metrics['mean_score']:.6f}")
+            print(f"Score gap: {metrics['top_score'] - metrics['second_score']:.6f}")
             print(f"Top/mean ratio: {metrics['top_to_mean_ratio']:.4f}")
             print(f"Gap ratio: {metrics['gap_ratio']:.4f}")
             print(f"Top document type: {top_type}")
+            print(
+                "Score interpretation: "
+                "cross-encoder ranking signal, not calibrated probability"
+            )
 
         print(f"Evidence strength: {evidence_strength}")
         print(f"Retrieval decision: {decision}")
