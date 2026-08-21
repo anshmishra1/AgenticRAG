@@ -1,0 +1,713 @@
+Absolutely. Based **only on the run log you sent**, I would write down the changes as a concrete backlog before touching the code.
+
+I would **not implement all of these immediately**. This is the change list I recommend we agree on first.
+
+# Recommended Changes — Baseline → Next Version
+
+## Priority 0 — Do NOT change
+
+These parts of the current system are behaving well and should remain intact.
+
+### 1. Keep hybrid retrieval
+
+```text
+Dense
+  +
+BM25
+  ↓
+RRF
+```
+
+No change recommended.
+
+### 2. Keep cross-encoder reranking
+
+```text
+Hybrid candidates
+       ↓
+Cross-encoder
+       ↓
+Top candidates
+```
+
+No change recommended.
+
+The DPO and MHA runs demonstrate that reranking is genuinely improving the evidence ordering. 
+
+### 3. Keep separate overview/content handling
+
+```text
+Overview → top 2
+Content  → top 5
+```
+
+No immediate change.
+
+### 4. Keep the current observability
+
+The structured trace is actually very useful:
+
+```text
+contextualize
+retrieve
+assess
+generate
+hallucination
+record_turn
+```
+
+Keep it.
+
+---
+
+# Priority 1 — Fix Retrieval Assessment
+
+This is the **most important change**.
+
+Currently the assessor is effectively saying:
+
+```text
+top score is much better than the rest
+        ↓
+strong evidence
+```
+
+But the hardware example proves that this isn't sufficient.
+
+It had:
+
+```text
+Top       = 0.029605
+Second    = 0.003221
+Mean      = 0.005153
+Top/Mean  = 5.7455
+```
+
+and was nevertheless classified as:
+
+```text
+strong → generate
+```
+
+
+
+### Change
+
+We should make retrieval assessment consider **both absolute and relative evidence**.
+
+Instead of:
+
+```python
+if top_to_mean_ratio > X:
+    strong
+```
+
+we eventually want something conceptually like:
+
+```text
+                Absolute relevance
+                       +
+                Relative separation
+                       +
+                Candidate distribution
+                       ↓
+                Evidence strength
+```
+
+For example:
+
+```text
+Strong:
+    absolute score sufficiently high
+    AND distribution is convincing
+
+Moderate:
+    reasonable evidence
+    but not strongly supported
+
+Weak:
+    low absolute relevance
+    regardless of relative separation
+```
+
+**Important:** I do not recommend hardcoding the exact thresholds yet. We should derive them from your observed score distributions.
+
+---
+
+# Priority 2 — Separate "relative confidence" from "evidence strength"
+
+I recommend changing the terminology/data model slightly.
+
+Currently you have things such as:
+
+```text
+top_score
+second_score
+mean_score
+gap
+top_to_mean_ratio
+gap_ratio
+evidence_strength
+```
+
+The problem is that these metrics represent different things.
+
+I'd eventually record:
+
+```text
+absolute_relevance
+relative_separation
+evidence_strength
+```
+
+For example:
+
+```json
+{
+    "top_score": 0.846,
+    "score_gap": 0.079,
+    "top_to_mean_ratio": 2.32,
+
+    "absolute_relevance": "high",
+    "relative_separation": "good",
+    "evidence_strength": "strong"
+}
+```
+
+versus:
+
+```json
+{
+    "top_score": 0.029,
+    "score_gap": 0.026,
+    "top_to_mean_ratio": 5.74,
+
+    "absolute_relevance": "low",
+    "relative_separation": "excellent",
+    "evidence_strength": "weak"
+}
+```
+
+That second example is exactly the situation your current system mishandles.
+
+---
+
+# Priority 3 — Fix the refusal state
+
+Currently:
+
+```text
+LLM → "I don't know."
+       ↓
+skip hallucination check
+       ↓
+normalized_grade = grounded
+       ↓
+record_turn
+       ↓
+END
+```
+
+The log explicitly shows this behavior. 
+
+The hallucination checker skipping a refusal is fine.
+
+**The problem is the resulting state.**
+
+I recommend introducing a distinct state:
+
+```text
+grounded
+hallucinated
+refusal
+```
+
+instead of:
+
+```text
+grounded
+hallucinated
+```
+
+So:
+
+```python
+hallucination_grade = "refusal"
+```
+
+rather than:
+
+```python
+hallucination_grade = "grounded"
+```
+
+when the answer is:
+
+```text
+"I don't know."
+```
+
+This will make your trace semantically correct.
+
+---
+
+# Priority 4 — Make refusal potentially recoverable
+
+Once Priority 3 exists, the graph can distinguish:
+
+```text
+grounded
+      ↓
+END
+```
+
+from:
+
+```text
+refusal
+      ↓
+DECIDE
+```
+
+But **I don't recommend blindly retrying every refusal**.
+
+We need to distinguish:
+
+### Case A — Retrieval is weak
+
+```text
+weak retrieval
+    ↓
+"I don't know"
+    ↓
+query rewrite / corrective retrieval
+```
+
+### Case B — Retrieval is actually strong
+
+```text
+strong retrieval
+    ↓
+"I don't know"
+    ↓
+probably generation/model problem
+```
+
+### Case C — Document genuinely doesn't contain the answer
+
+```text
+weak evidence
+    ↓
+retry/rewrite
+    ↓
+still weak
+    ↓
+"I don't know"
+    ↓
+END
+```
+
+This is where your agentic behavior becomes meaningful.
+
+---
+
+# Priority 5 — Actually activate corrective RAG
+
+Your graph already has the conceptual structure for this.
+
+But the log shows that weak cases are often routed:
+
+```text
+assess
+  ↓
+generate
+```
+
+because the assessor labels them `strong`.
+
+So corrective retrieval isn't getting enough opportunity to operate.
+
+After Priority 1:
+
+```text
+QUERY
+  ↓
+RETRIEVE
+  ↓
+ASSESS
+  ├── strong ─────→ GENERATE
+  │
+  ├── moderate ───→ GENERATE / optional refinement
+  │
+  └── weak ───────→ REWRITE
+                         ↓
+                      RETRIEVE
+```
+
+That is the change I'd consider the **core agentic-RAG improvement**.
+
+---
+
+# Priority 6 — Add retry/rewrite observability
+
+When corrective retrieval eventually runs, I want the trace to clearly tell us:
+
+```json
+{
+    "attempt": 1,
+    "query": "...",
+    "retrieval_strength": "weak",
+    "action": "rewrite"
+}
+```
+
+then:
+
+```json
+{
+    "attempt": 2,
+    "query": "...rewritten query...",
+    "retrieval_strength": "strong",
+    "action": "generate"
+}
+```
+
+Currently you have retry information primarily around hallucination:
+
+```text
+retry_count
+maximum_retries
+```
+
+but the retrieval-correction path needs equally explicit instrumentation.
+
+---
+
+# Priority 7 — Don't treat "generate" as synonymous with "success"
+
+The current trace has:
+
+```text
+retrieval_decision = generate
+```
+
+and then ultimately:
+
+```text
+answer_verified = true
+```
+
+For a refusal, that can become misleading.
+
+I'd eventually separate:
+
+```text
+retrieval_decision
+generation_outcome
+verification_outcome
+final_answer_state
+```
+
+For example:
+
+```json
+{
+    "retrieval_decision": "generate",
+    "generation_outcome": "refusal",
+    "verification_outcome": "skipped",
+    "final_answer_state": "unresolved"
+}
+```
+
+That will make debugging the graph substantially easier.
+
+---
+
+# Priority 8 — Investigate duplicate/overlapping chunks
+
+The log shows cases where the same page appears multiple times:
+
+```text
+page 81
+page 81
+page 80
+page 80
+```
+
+For example, the MHA retrieval contains repeated page references. 
+
+Your current deduplication says:
+
+```text
+0 duplicates removed
+```
+
+which means these aren't technically duplicate vector records according to your current identity rule.
+
+I don't want to immediately change that.
+
+Instead, I'd investigate whether these are:
+
+```text
+different legitimate chunks
+```
+
+or:
+
+```text
+overlapping chunks created by chunking
+```
+
+If they're heavily overlapping, we can later introduce **semantic/adjacent-chunk deduplication**.
+
+This belongs closer to the vectorstore/chunking changes you said you haven't implemented yet.
+
+---
+
+# Priority 9 — Don't optimize retrieval prematurely
+
+The current retrieval latency is:
+
+```text
+5.16 sec
+3.35 sec
+2.69 sec
+```
+
+while reranking itself is around:
+
+```text
+1.4–1.8 sec
+```
+
+ 
+
+So I don't recommend immediately ripping apart the retrieval architecture.
+
+First fix **retrieval quality/decision-making**.
+
+Then measure again.
+
+Only afterward should we optimize:
+
+```text
+Pinecone calls
+BM25
+RRF
+cross-encoder
+candidate counts
+batching
+```
+
+---
+
+# Priority 10 — Generation optimization comes later
+
+Generation is currently:
+
+```text
+~48–52%
+```
+
+of total measured pipeline time. 
+
+That's currently the largest single component.
+
+But I don't recommend trying to reduce it yet.
+
+Why?
+
+Because your generation behavior is reasonable:
+
+```text
+~1 sec → refusal
+~5–6 sec → detailed answer
+```
+
+So before optimizing it, we should implement **streaming**.
+
+That changes the user experience dramatically without necessarily reducing backend generation time.
+
+---
+
+# Priority 11 — Streaming
+
+After retrieval/corrective behavior is stable:
+
+```text
+FastAPI
+   ↓
+LangGraph
+   ↓
+LLM streaming
+   ↓
+Streamlit
+```
+
+The user should see:
+
+```text
+Generating...
+
+The primary difference between MHA...
+```
+
+instead of waiting 5–6 seconds for the entire answer.
+
+This should be treated as a **UX/perceived-latency improvement**, not a retrieval architecture change.
+
+---
+
+# Priority 12 — Build a deliberate evaluation set
+
+This is something I strongly recommend before we tune thresholds.
+
+We already accidentally have four useful categories from your log:
+
+### Category A — Clearly answerable
+
+MHA:
+
+```text
+strong retrieval
+good answer
+grounded
+```
+
+### Category B — Clearly answerable with exact technical detail
+
+DPO:
+
+```text
+very strong retrieval
+good answer
+grounded
+```
+
+### Category C — Weak/unanswerable
+
+Hardware:
+
+```text
+very low absolute relevance
+"I don't know"
+```
+
+### Category D — Ambiguous/poorly retrieved
+
+RoPE:
+
+```text
+weak/moderate evidence
+"I don't know"
+```
+
+We should expand this to maybe:
+
+```text
+10–20 test questions
+```
+
+covering:
+
+```text
+answerable
+partially answerable
+unanswerable
+ambiguous
+follow-up questions
+exact-number questions
+conceptual questions
+multi-hop questions
+```
+
+Then tune the retrieval assessor against that.
+
+---
+
+# So the actual implementation roadmap I'd recommend
+
+I'd freeze the current code and treat this run as **Baseline V0**.
+
+Then:
+
+```text
+                    CURRENT
+                       │
+                       ▼
+              ┌─────────────────┐
+              │ Vectorstore     │
+              │ changes         │
+              └────────┬────────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │ Retrieval       │
+              │ confidence      │
+              │ calibration     │
+              └────────┬────────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │ Refusal state   │
+              │ correction      │
+              └────────┬────────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │ Corrective RAG  │
+              │ retry/rewrite   │
+              └────────┬────────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │ Evaluation      │
+              │ test set        │
+              └────────┬────────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │ Streaming       │
+              └────────┬────────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │ Performance     │
+              │ optimization    │
+              └─────────────────┘
+```
+
+## In short
+
+### **Must change**
+
+1. Retrieval confidence logic.
+2. Absolute relevance threshold.
+3. Separate relative-vs-absolute evidence.
+4. Refusal as a distinct state.
+5. Corrective retrieval for genuinely weak evidence.
+6. Better trace fields for retries/final outcome.
+
+### **Should investigate**
+
+7. Overlapping/duplicate chunks.
+8. Retrieval latency breakdown.
+9. Evaluation dataset.
+
+### **Later**
+
+10. Streaming.
+11. Generation optimization.
+12. Retrieval performance optimization.
+
+### **Should NOT change right now**
+
+* Dense retrieval.
+* BM25.
+* RRF.
+* Cross-encoder.
+* Overview/content split.
+* Existing graph structure.
+* Existing structured tracing.
+
+That is the **exact change backlog I would carry forward from this log**. The important thing is that we're not reacting to every line of the log and rewriting the whole application; the current architecture is sufficiently sound that the next work should be **targeted improvements to decision quality and corrective behavior**.
