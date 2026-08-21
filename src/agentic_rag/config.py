@@ -88,6 +88,9 @@ class Settings(BaseSettings):
     rerank_top_k_content: int = 5
     rerank_top_k_overview: int = 2
     cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    # Local reranker execution. "auto" selects CUDA when available, else CPU.
+    cross_encoder_device: str = "auto"
+    cross_encoder_batch_size: int = 32
 
     # Development
     debug: bool = False

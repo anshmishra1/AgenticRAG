@@ -60,6 +60,9 @@ class RAGState(TypedDict, total=False):
 
     hallucination_grade: str
     hallucination_retry_count: int
+    grounding_diagnosis: str
+    grounding_unsupported_claims: list[str]
+    correction_attempted: bool
 
     # ---------------------------------------------------------
     # Corrective retrieval

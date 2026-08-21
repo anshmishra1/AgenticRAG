@@ -89,31 +89,43 @@ def route_after_contextualization(state: RAGState) -> str:
     return decision
 
 def route_after_hallucination_check(state: RAGState) -> str:
-    grade = state.get("hallucination_grade")
-    retry_count = state.get("hallucination_retry_count", 0)
+    diagnosis = state.get("grounding_diagnosis", state.get("hallucination_grade"))
+    correction_attempted = state.get("correction_attempted", False)
+    retry_count = state.get("retry_count", 0)
 
     print("\n" + "=" * 70)
     print("GRAPH ROUTER: AFTER HALLUCINATION CHECK")
     print("=" * 70)
+    print(f"Grounding diagnosis: {diagnosis}")
+    print(f"Correction already attempted: {correction_attempted}")
+    print(f"Retrieval retry count: {retry_count} / {settings.max_retries}")
 
-    print(f"Hallucination grade: {grade}")
-    print(f"Retry count: {retry_count}")
-    print(f"Maximum retries: {settings.max_retries}")
-
-    if grade == "grounded":
+    if diagnosis == "grounded":
         decision = "end"
         print("ROUTE -> record_turn")
-        log_stage("route_after_hallucination_check", hallucination_grade=grade, retry_count=retry_count, decision=decision)
+        log_stage("route_after_hallucination_check", grounding_diagnosis=diagnosis, correction_attempted=correction_attempted, decision=decision)
         return decision
 
-    if retry_count >= settings.max_retries:
+    if correction_attempted:
+        # One correction already spent - do not loop again regardless of
+        # diagnosis. record_turn's disclaimer covers a still-unverified answer.
         decision = "end"
         print("ROUTE -> record_turn")
-        print("Reason: maximum retries reached.")
-        log_stage("route_after_hallucination_check", hallucination_grade=grade, retry_count=retry_count, decision=decision)
+        print("Reason: single correction budget already spent.")
+        log_stage("route_after_hallucination_check", grounding_diagnosis=diagnosis, correction_attempted=correction_attempted, decision=decision)
         return decision
 
-    decision = "generate"
+    if diagnosis == "insufficient_evidence" and retry_count < settings.max_retries:
+        decision = "rewrite_query"
+        print(f"ROUTE -> {decision}")
+        print("Reason: evidence is thin, not a generation error - retrieve again.")
+        log_stage("route_after_hallucination_check", grounding_diagnosis=diagnosis, correction_attempted=correction_attempted, decision=decision)
+        return decision
+
+    # unsupported, or insufficient_evidence with retrieval retries exhausted
+    decision = "correct_generation"
     print(f"ROUTE -> {decision}")
-    log_stage("route_after_hallucination_check", hallucination_grade=grade, retry_count=retry_count, decision=decision)
+    if diagnosis == "insufficient_evidence":
+        print("Reason: insufficient evidence but retrieval retries exhausted - falling back to constrained regeneration.")
+    log_stage("route_after_hallucination_check", grounding_diagnosis=diagnosis, correction_attempted=correction_attempted, decision=decision)
     return decision

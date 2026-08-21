@@ -25,12 +25,14 @@ from agentic_rag.graph.nodes import (
     assess_retrieval,
     contextualize_question,
     check_hallucination,
+    correct_generation,      # NEW
     generate,
     grade_documents,
     record_turn,
     retrieve,
     rewrite_query,
 )
+
 from agentic_rag.graph.state import RAGState
 
 
@@ -49,6 +51,7 @@ def build_graph(checkpointer: BaseCheckpointSaver):
     graph.add_node("generate", generate)
     graph.add_node("check_hallucination", check_hallucination)
     graph.add_node("record_turn", record_turn)
+    graph.add_node("correct_generation", correct_generation)   
 
     # ---------------------------------------------------------
     # Entry point
@@ -128,10 +131,21 @@ def build_graph(checkpointer: BaseCheckpointSaver):
         "check_hallucination",
         route_after_hallucination_check,
         {
-            "generate": "generate",
+            "rewrite_query": "rewrite_query",           # insufficient_evidence -> retrieval problem
+            "correct_generation": "correct_generation",  # unsupported -> generation problem
             "end": "record_turn",
         },
     )
+
+    # ---------------------------------------------------------
+    # Corrective regeneration -> final verification pass
+    # ---------------------------------------------------------
+
+    graph.add_edge(
+        "correct_generation",
+        "check_hallucination",
+    )
+    
     # ---------------------------------------------------------
     # Record conversation
     # ---------------------------------------------------------

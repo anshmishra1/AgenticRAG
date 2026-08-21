@@ -6,3 +6,6 @@ mlruns/
 *.egg-info/
 .venv/
 temp.pdf
+.md
+.txt
+.pdf

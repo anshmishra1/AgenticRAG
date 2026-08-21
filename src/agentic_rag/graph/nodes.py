@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import re
 import json
+from concurrent.futures import ThreadPoolExecutor
 import logging
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -23,14 +24,18 @@ from langchain_core.messages import AIMessage, HumanMessage
 from agentic_rag.config import settings
 from agentic_rag.graph.state import RAGState
 from agentic_rag.llm.provider import provider_chain, fast_provider_chain
-from agentic_rag.retrieval.vectorstore import retrieve_hybrid_with_scores
-from agentic_rag.retrieval.reranker import rerank
+from agentic_rag.retrieval.vectorstore import (
+    build_query_representation,
+    retrieve_hybrid_with_scores,
+)
+from agentic_rag.retrieval.reranker import rerank_many
 from agentic_rag.retrieval.sparse import load_bm25_json
 from agentic_rag.ingestion.registry import get_bm25_params
 from agentic_rag.policies.conversation  import classify_query_intent
 from agentic_rag.policies.retrieval import assess_retrieval_confidence
 from agentic_rag.policies.generation import apply_generation_limits, is_refusal_answer
 from agentic_rag.core.timing import PerformanceTracker
+from agentic_rag.policies.grounding import parse_grounding_response, GROUNDING_VERDICTS
 
 logger = logging.getLogger(__name__)
 tracker = PerformanceTracker()
@@ -192,6 +197,8 @@ def contextualize_question(state: RAGState) -> dict:
                 "query_is_control": True,
                 "contextualization_used": False,
                 "retrieval_query": question,
+                "hallucination_retry_count": 0,
+                "correction_attempted": False,
                 "trace": [{
                     "stage": "contextualize_question",
                     "question": question,
@@ -249,6 +256,8 @@ def contextualize_question(state: RAGState) -> dict:
             "query_is_control": False,
             "contextualization_used": True,
             "retrieval_query": rewritten,
+            "hallucination_retry_count": 0,
+            "correction_attempted": False,
             "trace": [{
                 "stage": "contextualize_question",
                 "question": question,
@@ -404,75 +413,76 @@ def retrieve(state: RAGState) -> dict:
                 print("falling back to dense-only retrieval (document may")
                 print("predate the hybrid-search change).")
         else:
-            # Backward-compatible fallback. Normal application queries should
-            # provide document_id when the user is asking about one document.
             overview_filter = {"type": {"$eq": "overview"}}
             content_filter = None
             bm25_encoder = None
             print("Document scope: GLOBAL (no document_id supplied) - dense-only.")
 
-        # Wide recall via hybrid (dense + sparse) search, then a precise
-        # re-rank down to the final k. The recall step optimizes for not
-        # missing the right chunk; the rerank step optimizes for ordering -
-        # this is why hybrid_candidate_k is deliberately larger than the
-        # final rerank_top_k values below.
-        overview_candidates = retrieve_hybrid_with_scores(
-            query=query,
-            bm25_encoder=bm25_encoder,
-            k=settings.hybrid_candidate_k,
-            filter=overview_filter,
+        # ---------------------------------------------------------
+        # Query representation is built exactly once.
+        # ---------------------------------------------------------
+        representation = build_query_representation(query, bm25_encoder)
+        print("Query representation: dense=1 | sparse=" + ("1" if representation.sparse is not None else "0"))
+
+        # ---------------------------------------------------------
+        # Overview/content retrieval are independent I/O operations.
+        # Run them concurrently while sharing the same query vectors.
+        # ---------------------------------------------------------
+        retrieval_args = (
+            {
+                "query": query,
+                "bm25_encoder": bm25_encoder,
+                "k": settings.hybrid_candidate_k,
+                "filter": overview_filter,
+                "query_representation": representation,
+            },
+            {
+                "query": query,
+                "bm25_encoder": bm25_encoder,
+                "k": settings.hybrid_candidate_k,
+                "filter": content_filter,
+                "query_representation": representation,
+            },
         )
 
-        content_candidates = retrieve_hybrid_with_scores(
-            query=query,
-            bm25_encoder=bm25_encoder,
-            k=settings.hybrid_candidate_k,
-            filter=content_filter,
-        )
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rag-retrieval") as executor:
+            overview_future = executor.submit(retrieve_hybrid_with_scores, **retrieval_args[0])
+            content_future = executor.submit(retrieve_hybrid_with_scores, **retrieval_args[1])
+            overview_payload = overview_future.result()
+            content_payload = content_future.result()
+
+        overview_candidates, overview_diagnostics = overview_payload
+        content_candidates, content_diagnostics = content_payload
 
         # ---------------------------------------------------------
         # Query-time candidate deduplication
         # ---------------------------------------------------------
-        overview_candidates, overview_duplicates_removed = (
-            _deduplicate_candidates(overview_candidates)
-        )
-
-        content_candidates, content_duplicates_removed = (
-            _deduplicate_candidates(content_candidates)
-        )
+        overview_candidates, overview_duplicates_removed = _deduplicate_candidates(overview_candidates)
+        content_candidates, content_duplicates_removed = _deduplicate_candidates(content_candidates)
 
         print("\n" + "-" * 70)
         print("HYBRID CANDIDATE DEDUPLICATION")
         print("-" * 70)
-
-        print(
-            f"Overview: "
-            f"{len(overview_candidates) + overview_duplicates_removed} "
-            f"-> {len(overview_candidates)} "
-            f"({overview_duplicates_removed} duplicates removed)"
-        )
-
-        print(
-            f"Content: "
-            f"{len(content_candidates) + content_duplicates_removed} "
-            f"-> {len(content_candidates)} "
-            f"({content_duplicates_removed} duplicates removed)"
-        )
+        print(f"Overview: {len(overview_candidates) + overview_duplicates_removed} -> {len(overview_candidates)} ({overview_duplicates_removed} duplicates removed)")
+        print(f"Content: {len(content_candidates) + content_duplicates_removed} -> {len(content_candidates)} ({content_duplicates_removed} duplicates removed)")
 
         # ---------------------------------------------------------
-        # Cross-encoder reranking
+        # One cross-encoder inference batch for both groups.
         # ---------------------------------------------------------
-        overview_results = rerank(
+        reranked = rerank_many(
             query,
-            overview_candidates,
-            top_k=settings.rerank_top_k_overview,
+            {
+                "overview": overview_candidates,
+                "content": content_candidates,
+            },
+            {
+                "overview": settings.rerank_top_k_overview,
+                "content": settings.rerank_top_k_content,
+            },
         )
 
-        content_results = rerank(
-            query,
-            content_candidates,
-            top_k=settings.rerank_top_k_content,
-        )
+        overview_results = reranked.get("overview", [])
+        content_results = reranked.get("content", [])
 
         results = overview_results + content_results
         results.sort(key=lambda item: float(item[1]), reverse=True)
@@ -537,47 +547,34 @@ def retrieve(state: RAGState) -> dict:
                 "gap_ratio": metrics["gap_ratio"],
                 "overview_top_score": overview_top_score,
                 "content_top_score": content_top_score,
-                "retrieval_method": (
-                    "dense+bm25+rrf+cross_encoder"
-                    if bm25_encoder
-                    else "dense+cross_encoder"
-                ),
+                "retrieval_method": "dense+bm25+rrf+cross_encoder" if bm25_encoder else "dense+cross_encoder",
+                "query_vectors_computed": {"dense": 1, "sparse": 1 if representation.sparse is not None else 0},
+                "retrieval_execution": "parallel",
+                "reranker_execution": "single_batch",
+                "overview_rrf_diagnostics": overview_diagnostics,
+                "content_rrf_diagnostics": content_diagnostics,
                 "deduplication": {
-                    "overview_candidates_before": (
-                        len(overview_candidates)
-                        + overview_duplicates_removed
-                    ),
+                    "overview_candidates_before": len(overview_candidates) + overview_duplicates_removed,
                     "overview_candidates_after": len(overview_candidates),
                     "overview_duplicates_removed": overview_duplicates_removed,
-                    "content_candidates_before": (
-                        len(content_candidates)
-                        + content_duplicates_removed
-                    ),
+                    "content_candidates_before": len(content_candidates) + content_duplicates_removed,
                     "content_candidates_after": len(content_candidates),
                     "content_duplicates_removed": content_duplicates_removed,
                 },
                 "reranker_scores": [
                     {
                         "rank": rank,
-                        "page": doc.metadata.get(
-                            "page_label",
-                            doc.metadata.get("page"),
-                        ),
+                        "page": doc.metadata.get("page_label", doc.metadata.get("page")),
                         "type": doc.metadata.get("type"),
-                        "rrf_score": doc.metadata.get(
-                            "_retrieval_rrf_score"
-                        ),
-                        "cross_encoder_logit": doc.metadata.get(
-                            "_cross_encoder_logit"
-                        ),
-                        "cross_encoder_score": doc.metadata.get(
-                            "_cross_encoder_score"
-                        ),
+                        "rrf_score": doc.metadata.get("_retrieval_rrf_score"),
+                        "cross_encoder_logit": doc.metadata.get("_cross_encoder_logit"),
+                        "cross_encoder_score": doc.metadata.get("_cross_encoder_score"),
                     }
                     for rank, doc in enumerate(docs, start=1)
-                ]
-            }]
+                ],
+            }],
         }
+
 
 # =============================================================
 # Retrieval assessment — NEW optimization layer
@@ -847,11 +844,14 @@ def check_hallucination(state: RAGState) -> dict:
             print("factual claim, so there's nothing to verify as grounded.")
             return {
                 "hallucination_grade": "grounded",
+                "grounding_diagnosis": "grounded",
+                "grounding_unsupported_claims": [],
                 "hallucination_retry_count": state.get("hallucination_retry_count", 0),
                 "trace": [{
                     "stage": "check_hallucination",
                     "raw_grade": "skipped_refusal_short_circuit",
                     "normalized_grade": "grounded",
+                    "grounding_diagnosis": "grounded",
                     "hallucination_retry_count": state.get("hallucination_retry_count", 0),
                 }],
             }
@@ -860,42 +860,161 @@ def check_hallucination(state: RAGState) -> dict:
         context = "\n\n".join(d.page_content for d in documents)
 
         prompt = (
-            "Is the following answer fully supported by the context below? "
-            "Answer with exactly one word: 'grounded' or 'hallucinated'.\n\n"
+            "You are a grounding verifier. Compare the answer against the "
+            "supplied context and classify it as exactly one of:\n\n"
+            "\"grounded\" - every claim in the answer is directly supported "
+            "by the context.\n"
+            "\"insufficient_evidence\" - the context does not contain enough "
+            "information to fully answer the question; the answer goes "
+            "beyond what the context establishes because the EVIDENCE is "
+            "thin, not because the answer misrepresents it.\n"
+            "\"unsupported\" - the context contains relevant information, "
+            "but the answer makes specific claims that contradict it or "
+            "are not present in it.\n\n"
+            "Respond with ONLY a JSON object, no other text:\n"
+            '{"verdict": "grounded" | "insufficient_evidence" | "unsupported", '
+            '"unsupported_claims": ["..."]}\n\n'
+            "unsupported_claims should be empty for \"grounded\" and should "
+            "list the specific unsupported sentence(s) otherwise.\n\n"
             f"Context:\n{context}\n\n"
             f"Answer:\n{generation}"
         )
 
         result = fast_provider_chain.invoke(prompt)
-        raw_grade = result.content.strip().lower()
-        grade = (
-            "grounded"
-            if "grounded" in raw_grade and "hallucinated" not in raw_grade
-            else "hallucinated"
-        )
+        raw = result.content.strip()
+        verdict, unsupported_claims, parsed_ok = parse_grounding_response(raw)
+
+        if not parsed_ok:
+            print(f"WARNING: failed to parse grounding response; "
+                  f"defaulting to 'unsupported' (fail closed).\nRaw: {raw!r}")
+
+        grade = "grounded" if verdict == "grounded" else "hallucinated"
+
+        if verdict == "unsupported" and raw and "unsupported" not in raw.lower():
+            # heuristic: only true if parsing actually failed vs. legitimately
+            # returned "unsupported" - keeping the warning print here since
+            # nodes.py owns diagnostics/logging, not the policy module.
+            print(f"WARNING: could not confidently parse grounding response: {raw!r}")
+
+        grade = "grounded" if verdict == "grounded" else "hallucinated"
 
         hallucination_retry_count = state.get("hallucination_retry_count", 0)
-        if grade == "hallucinated":
+        if verdict != "grounded":
             hallucination_retry_count += 1
+
+        print(f"\nRaw grounding response: {raw}")
+        print(f"Parsed verdict: {verdict}")
+        print(f"Unsupported claims: {unsupported_claims}")
 
         return {
             "hallucination_grade": grade,
+            "grounding_diagnosis": verdict,
+            "grounding_unsupported_claims": unsupported_claims,
             "hallucination_retry_count": hallucination_retry_count,
             "trace": [{
                 "stage": "check_hallucination",
-                "raw_grade": raw_grade,
+                "raw_grade": raw,
                 "normalized_grade": grade,
+                "grounding_diagnosis": verdict,
+                "unsupported_claims": unsupported_claims,
                 "hallucination_retry_count": hallucination_retry_count,
             }],
         }
 
 
 # =============================================================
+# Corrective Regeneration — NEW, single bounded correction
+# =============================================================
+
+def correct_generation(state: RAGState) -> dict:
+    """Single bounded corrective regeneration, triggered only when the
+    grounding diagnosis is 'unsupported' (generation overclaimed) rather than
+    'insufficient_evidence' (a retrieval problem, routed to rewrite_query
+    instead). Feeds the specific unsupported claims back into the prompt so
+    the model corrects the actual failure instead of blindly retrying with
+    the same instructions against the same evidence."""
+    with tracker.measure("correct_generation"):
+        _separator("6b. CORRECTIVE REGENERATION")
+
+        documents = state.get("documents", [])
+        history = state.get("messages", [])
+        previous_generation = state.get("generation", "")
+        unsupported_claims = state.get("grounding_unsupported_claims", [])
+
+        context, history = apply_generation_limits(documents, history)
+
+        history_text = (
+            "\n".join(f"{m.type}: {m.content}" for m in history)
+            if history else "None"
+        )
+
+        claims_text = (
+            "\n".join(f"- {c}" for c in unsupported_claims)
+            if unsupported_claims
+            else "(no specific claims identified - be more conservative overall)"
+        )
+
+        prompt = (
+            "Your previous answer contained claims that are not supported "
+            "by the provided context:\n\n"
+            f"{claims_text}\n\n"
+            "Rewrite the answer using ONLY claims directly supported by the "
+            "context below. If the context does not establish something, "
+            "explicitly say the document does not cover it rather than "
+            "omitting it silently. Preserve the user's requested level of "
+            "detail and formatting where the context allows it.\n\n"
+            f"Prior conversation:\n{history_text}\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question: {state['question']}\n\n"
+            f"Previous (flawed) answer:\n{previous_generation}"
+        )
+
+        result = provider_chain.invoke(prompt)
+        generation = result.content.strip()
+
+        print(f"Corrected answer characters: {len(generation)}")
+
+        return {
+            "generation": generation,
+            "correction_attempted": True,
+            "trace": [{
+                "stage": "correct_generation",
+                "unsupported_claims": unsupported_claims,
+                "previous_answer": previous_generation,
+                "corrected_answer": generation,
+            }],
+        }
+
+# =============================================================
 # Record Turn
 # =============================================================
 
+_UNVERIFIED_DISCLAIMER = (
+    "Note: this answer could not be fully verified against the retrieved "
+    "sources after multiple attempts. Treat it with extra caution and "
+    "consider rephrasing your question.\n\n"
+)
+
+
 def record_turn(state: RAGState) -> dict:
     _separator("8. RECORD TURN")
+
+    hallucination_grade = state.get("hallucination_grade")
+    hallucination_retry_count = state.get("hallucination_retry_count", 0)
+
+    # An answer only counts as verified if the LAST hallucination check said
+    # "grounded". If the loop exhausted its retries while still
+    # "hallucinated", the answer must not be shipped silently as if it
+    # passed - this was previously a silent failure mode. hallucination_grade
+    # is None for control-message turns (they skip generation entirely), so
+    # we don't attach a disclaimer to those.
+    answer_verified = hallucination_grade == "grounded"
+
+    generation = state.get("generation", "")
+    if not answer_verified and hallucination_grade is not None:
+        print("\nWARNING: answer reached record_turn without passing the")
+        print("hallucination check (exhausted retries). Attaching disclaimer.")
+        generation = _UNVERIFIED_DISCLAIMER + generation
 
     final_entry = {
         "stage": "record_turn",
@@ -904,6 +1023,9 @@ def record_turn(state: RAGState) -> dict:
         "retrieval_decision": state.get("retrieval_decision"),
         "retrieval_evidence_strength": state.get("retrieval_evidence_strength"),
         "retrieval_decision_reason": state.get("retrieval_decision_reason"),
+        "hallucination_final_grade": hallucination_grade,
+        "hallucination_retry_count": hallucination_retry_count,
+        "answer_verified": answer_verified,
     }
 
     full_trace = state.get("trace", []) + [final_entry]
@@ -916,7 +1038,7 @@ def record_turn(state: RAGState) -> dict:
     return {
         "messages": [
             HumanMessage(content=state["question"]),
-            AIMessage(content=state["generation"]),
+            AIMessage(content=generation),
         ],
         "trace": [final_entry],
     }

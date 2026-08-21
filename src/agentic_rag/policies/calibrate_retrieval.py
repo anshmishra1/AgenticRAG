@@ -53,7 +53,10 @@ def _top_score(query: str, document_id: str) -> float:
     bm25_params = get_bm25_params(document_id)
     bm25_encoder = load_bm25_json(bm25_params) if bm25_params else None
 
-    candidates = retrieve_hybrid_with_scores(
+    # retrieve_hybrid_with_scores now returns (fused_results, diagnostics) -
+    # the diagnostics dict carries per-signal dense/bm25/rrf breakdowns, not
+    # needed here, so it's discarded.
+    candidates, _diagnostics = retrieve_hybrid_with_scores(
         query=query,
         bm25_encoder=bm25_encoder,
         k=settings.hybrid_candidate_k,

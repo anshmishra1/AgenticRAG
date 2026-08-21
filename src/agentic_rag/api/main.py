@@ -21,11 +21,10 @@ from agentic_rag.graph.builder import build_graph
 from agentic_rag.ingestion.pipeline import _document_id, ingest_file
 from agentic_rag.ingestion.registry import list_documents
 from agentic_rag.observability.trace import configure_logging
+from agentic_rag.retrieval.reranker import warmup_cross_encoder
 
-# Configure logging
 configure_logging(settings.debug)
 
-# Mute noisy HTTP and Hugging Face Hub logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
@@ -34,6 +33,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 async def lifespan(app: FastAPI):
     with PostgresSaver.from_conn_string(settings.postgres_url) as checkpointer:
         checkpointer.setup()  # Creates checkpoint tables if they don't exist yet; idempotent
+        warmup_cross_encoder()
         app.state.rag_graph = build_graph(checkpointer)
         yield
     # Connection closes automatically here on shutdown
@@ -62,19 +62,6 @@ class IngestResult(BaseModel):
 @app.post("/query", response_model=QueryResponse)
 def query(request: QueryRequest, http_request: Request) -> QueryResponse:
     config = {"configurable": {"thread_id": request.session_id}}
-    initial_state = {
-        "question": request.question,
-        "document_id": request.document_id,
-        "retrieval_query": None,
-        "documents": [],
-        "generation": None,
-        "relevance_grade": None,
-        "hallucination_grade": None,
-        "retry_count": 0,
-        "hallucination_retry_count": 0,
-        "retrieval_scores": [],
-        "trace": [],
-    }
 
     result = http_request.app.state.rag_graph.invoke(
         {
@@ -85,7 +72,7 @@ def query(request: QueryRequest, http_request: Request) -> QueryResponse:
         },
         config=config,
     )
-    
+
     return QueryResponse(
         answer=result["generation"],
         grounded=result.get("hallucination_grade") == "grounded",
@@ -104,6 +91,8 @@ async def ingest(files: list[UploadFile] = File(...)) -> list[IngestResult]:
             tmp_path = tmp.name
 
         try:
+            # NOTE: document_id is still computed here AND again inside
+            # ingest_file() - flagged, not yet fixed pending pipeline.py.
             document_id = _document_id(Path(tmp_path))
             chunk_count = ingest_file(
                 tmp_path,
